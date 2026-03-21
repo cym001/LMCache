@@ -1,0 +1,1513 @@
+# SPDX-License-Identifier: Apache-2.0
+# Standard
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
+import asyncio
+import time
+import uuid
+from collections import OrderedDict
+
+# Third Party
+import msgspec
+import torch
+import zmq
+
+# First Party
+from lmcache.config import LMCacheEngineMetadata
+from lmcache.logging import init_logger
+from lmcache.utils import CacheEngineKey
+from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    PagedCpuGpuMemoryAllocator,
+)
+from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
+from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.transfer_channel import CreateTransferChannel
+from lmcache.v1.transfer_channel.transfer_utils import (
+    P2PInitSideMsg as KvTransferInitSideMsg,
+    P2PInitSideRetMsg as KvTransferInitSideRetMsg,
+)
+from lmcache.v1.transfer_channel.nixl_channel import (
+    NixlInitRequest,
+    NixlInitResponse,
+    NixlMemRegRequest,
+    NixlMemRegResponse,
+    NixlMsg,
+)
+from lmcache.v1.transfer_channel.transfer_utils import SideMsg
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.worker import LMCacheWorker
+
+logger = init_logger(__name__)
+
+
+class KvTransferMsgBase(msgspec.Struct, tag=True):
+    """Base class for all KV transfer-related messages"""
+
+    pass
+
+
+class BatchedLookupAndGetMsg(KvTransferMsgBase):
+    """Lookup and retrieve message"""
+
+    # Unique event ID for request-response correlation
+    event_id: str
+
+    lookup_id: str
+
+    receiver_id: str
+
+    # CacheEngineKey in string form
+    keys: list[str]
+
+    # Indexes (remote) of allocated memory objects (to be written)
+    mem_indexes: list[int]
+
+
+class BatchedLookupAndGetRetMsg(KvTransferMsgBase):
+    """Lookup and retrieve response message"""
+
+    # Unique event ID for request-response correlation
+    event_id: str
+
+    # Number of hit chunks
+    num_hit_chunks: int
+
+
+class BatchedLookupAndPutMsg(KvTransferMsgBase):
+    """Batched PUT request message"""
+
+    # Unique event ID for request-response correlation
+    event_id: str
+
+    sender_id: str
+
+    # CacheEngineKey in string form
+    keys: list[str]
+
+    # Number of tokens for each chunk
+    offsets: list[int]
+
+    # Indexes (remote) of allocated memory objects (to be read)
+    mem_indexes: list[int]
+
+
+class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
+    """Batched PUT response message"""
+
+    # Unique event ID for request-response correlation
+    event_id: str
+
+    # Number of read chunks
+    num_read_chunks: int
+
+
+KvTransferMsg = Union[
+    BatchedLookupAndGetMsg,
+    BatchedLookupAndGetRetMsg,
+    BatchedLookupAndPutMsg,
+    BatchedLookupAndPutRetMsg,
+]
+
+
+class KvTransferBackend(StorageBackendInterface):
+    """
+    KV Transfer Storage Backend for node-to-node KV cache transfer with connection reuse.
+    
+    Features:
+    - Arbitrary node-to-node KV transfer via ZMQ ports
+    - Connection pooling with LRU eviction and idle timeout
+    - Bidirectional transfer (GET/PUT operations)
+    """
+    def __init__(
+        self,
+        config: LMCacheEngineConfig,
+        metadata: LMCacheEngineMetadata,
+        loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+        max_connections: int = 100,
+        idle_timeout_seconds: float = 300.0,
+        cleanup_interval_seconds: float = 60.0,
+    ):
+        self.loop = loop
+        assert config.kv_transfer_host is not None, (
+            "kv_transfer_host must be specified"
+        )
+        assert config.kv_transfer_init_ports is not None, (
+            "kv_transfer_init_ports must be specified"
+        )
+
+        # Current node's worker id
+        self.worker_id = metadata.worker_id
+
+        # Current node's connection information
+        self.local_host = config.kv_transfer_host
+        self.local_init_port = config.kv_transfer_init_ports[self.worker_id]
+        self.local_init_url = f"{self.local_host}:{self.local_init_port}"
+
+        # ===== Connection Pool Configuration =====
+        # Maximum number of concurrent peer connections
+        self.max_connections = max_connections
+        # Idle timeout in seconds - connections unused for this duration will be closed
+        self.idle_timeout_seconds = idle_timeout_seconds
+        # Interval for running cleanup task
+        self.cleanup_interval_seconds = cleanup_interval_seconds
+        
+        logger.info(
+            f"KvTransfer Backend connection pool configured: "
+            f"max_connections={max_connections}, "
+            f"idle_timeout={idle_timeout_seconds}s, "
+            f"cleanup_interval={cleanup_interval_seconds}s"
+        )
+
+        # ===== Connection Management for Arbitrary KV Transfers =====
+        # These data structures enable connection reuse for efficient KV transfers
+        
+        # Set of connected peer_init_urls
+        # Using OrderedDict to maintain insertion order for LRU eviction
+        self.connected_peers: OrderedDict[str, bool] = OrderedDict()
+        
+        # Tracks last access time for each peer connection (for idle timeout)
+        # Maps peer_init_url -> last_used_timestamp
+        self.peer_last_used_time: dict[str, float] = {}
+        
+        # Temporary mapping for ongoing lookup operations
+        # Maps lookup_id -> (peer_init_url, location)
+        # This allows batched_get to find the correct peer after batched_contains
+        self.lookup_id_to_peer_mapping: dict[str, tuple[str, str]] = {}
+
+        # TODO(Jiayi): support gpu and local storage kv transfer as well.
+        self.local_cpu_backend = local_cpu_backend
+        self.memory_allocator = local_cpu_backend.get_memory_allocator()
+        assert isinstance(self.memory_allocator, PagedCpuGpuMemoryAllocator)
+
+        self.dtype = metadata.kv_dtype
+        self.full_size_shape = list(self.memory_allocator.cpu_allocator.shape)
+        # TODO(Jiayi): remove this hardcode
+        self.fmt: MemoryFormat = MemoryFormat.KV_2LTD
+        self.chunk_size = config.chunk_size
+
+        # Transfer channel for KV transfer communication
+        # (supports both sender and receiver roles)
+        # NOTE: peer_init_url is set to None to disable the built-in init loop
+        # We handle init requests in _handle_init_requests() instead
+        self.transfer_channel = CreateTransferChannel(
+            channel_type=config.transfer_channel,
+            async_mode=True,
+            role="both",
+            buffer_ptr=self.memory_allocator.cpu_allocator.buffer_ptr,
+            buffer_size=self.memory_allocator.cpu_allocator.buffer_size,
+            align_bytes=self.memory_allocator.cpu_allocator.align_bytes,
+            tp_rank=self.worker_id,
+            peer_init_url=None,  # Disable built-in init loop
+            backends=config.nixl_backends,
+            event_loop=loop,
+        )
+
+        # ===== ZMQ Socket Management for Connection Reuse =====
+        # Uses ROUTER/DEALER pattern for concurrent multi-client requests
+        
+        self.running = True
+        
+        # Maps peer_init_url -> ZMQ DEALER socket for sending requests to peer
+        # DEALER sockets support concurrent requests without blocking
+        self.peer_to_socket_mapping: dict[str, zmq.Socket] = {}
+        
+        # ===== Lock-free Request-Response Correlation =====
+        # Maps event_id -> asyncio.Future for pending requests
+        # Allows concurrent requests without locks
+        self.pending_requests: dict[str, asyncio.Future] = {}
+        # Lock only for modifying pending_requests dict (very fast)
+        self._pending_requests_lock = asyncio.Lock()
+        
+        # Lock to protect concurrent peer connection establishment
+        # Maps peer_init_url -> asyncio.Lock to prevent duplicate connections
+        self._peer_connection_locks: dict[str, asyncio.Lock] = {}
+        # Global lock for accessing _peer_connection_locks dict
+        self._peer_connection_locks_lock = asyncio.Lock()
+        
+        # Connection pool statistics
+        self.connection_pool_stats = {
+            "total_connections_created": 0,
+            "total_connections_closed": 0,
+            "lru_evictions": 0,
+            "idle_timeouts": 0,
+        }
+        
+        # Start background tasks
+        asyncio.run_coroutine_threadsafe(self._handle_init_requests(), loop)
+        asyncio.run_coroutine_threadsafe(self._connection_cleanup_task(), loop)
+
+    def __str__(self) -> str:
+        return "KvTransferBackend"
+
+    async def batched_async_contains(
+        self,
+        lookup_id: str,
+        keys: List[CacheEngineKey],
+        pin: bool = False,
+    ) -> int:
+        # KvTransferBackend does not support lookup without explicit peer connection
+        return NotImplementedError
+
+    async def _handle_init_requests(self):
+        """Handle initialization requests and KV transfer requests from peer nodes.
+        
+        Uses ROUTER socket to support concurrent multi-client requests.
+        ROUTER sockets automatically track client identity for routing responses.
+        """
+        logger.info(f"Starting KvTransfer ROUTER handler at {self.local_init_url}")
+        self.async_context = get_zmq_context()
+        self.init_socket = get_zmq_socket(
+            self.async_context,
+            self.local_init_url,
+            "tcp",
+            zmq.ROUTER,
+            "bind",
+        )
+
+        while self.running:
+            try:
+                # ROUTER socket receives: [identity, empty_frame, message]
+                frames = await self.init_socket.recv_multipart()
+                if len(frames) < 2:
+                    logger.warning(f"Received malformed message with {len(frames)} frames")
+                    continue
+                
+                # Extract identity and message
+                identity = frames[0]
+                # Handle both [identity, message] and [identity, empty, message] formats
+                req_bytes = frames[-1]
+
+                # Try to decode as NixlMsg or SideMsg first (init messages)
+                try:
+                    req = msgspec.msgpack.decode(
+                        req_bytes, type=Union[NixlMsg, SideMsg]
+                    )
+                    resp = await self._handle_init_msg(req)
+                except Exception:
+                    # If not init message, try KvTransferMsg (lookup requests)
+                    req = msgspec.msgpack.decode(req_bytes, type=KvTransferMsg)
+                    resp = await self._handle_kv_transfer_msg(req)
+
+                # ROUTER socket sends: [identity, empty_frame, message]
+                await self.init_socket.send_multipart([
+                    identity,
+                    b"",
+                    msgspec.msgpack.encode(resp)
+                ])
+
+            except Exception as e:
+                logger.error(f"Failed to process request: {e}")
+                if self.running:
+                    await asyncio.sleep(0.01)
+
+    async def _handle_init_msg(
+        self, req: Union[NixlMsg, KvTransferInitSideMsg]
+    ) -> Union[NixlMsg, KvTransferInitSideRetMsg]:
+        """Handle two-phase initialization: metadata exchange, memory registration."""
+        if isinstance(req, NixlInitRequest):
+            # Phase 1: Exchange agent metadata
+            agent_name = self.transfer_channel.nixl_agent.add_remote_agent(
+                req.local_meta_bytes
+            )
+            resp = NixlInitResponse(
+                remote_agent_name=agent_name,
+                remote_meta_bytes=self.transfer_channel.nixl_agent.get_agent_metadata(),
+            )
+            logger.debug("Phase 1: metadata exchange completed")
+            return resp
+
+        elif isinstance(req, NixlMemRegRequest):
+            # Phase 2: Register memory descriptors
+            local_xfer_descs = self.transfer_channel.nixl_agent.get_serialized_descs(
+                self.transfer_channel.nixl_wrapper.xfer_descs
+            )
+
+            remote_xfer_dlist_bytes = req.local_xfer_dlist_bytes
+            remote_xfer_dlist = self.transfer_channel.nixl_agent.deserialize_descs(
+                remote_xfer_dlist_bytes
+            )
+            remote_xfer_handlers = self.transfer_channel.nixl_agent.prep_xfer_dlist(
+                req.remote_agent_name, remote_xfer_dlist
+            )
+            
+            # Store remote xfer handlers using the remote peer's local_id
+            peer_init_url = req.local_id
+            self.transfer_channel.remote_xfer_handlers_dict[peer_init_url] = (
+                remote_xfer_handlers
+            )
+            
+            logger.info(f"Phase 2: memory registration completed for peer {peer_init_url}")
+            return NixlMemRegResponse(remote_xfer_dlist_bytes=local_xfer_descs)
+
+        elif isinstance(req, KvTransferInitSideMsg):
+            # Phase 3: No longer needed, just acknowledge
+            logger.debug("Phase 3: handshake completed")
+            return KvTransferInitSideRetMsg(peer_lookup_url="")
+
+        else:
+            raise ValueError(f"Unsupported InitMsg type: {type(req)}")
+
+    async def _handle_kv_transfer_msg(
+        self,
+        msg: KvTransferMsg,
+    ) -> KvTransferMsg:
+        """Handle KV transfer requests (GET/PUT) from peer nodes."""
+        if isinstance(msg, BatchedLookupAndGetMsg):
+            # Handle GET request from a peer node
+            event_id = msg.event_id
+            logger.info(
+                f"Received KV transfer batched GET request from receiver "
+                f"{msg.receiver_id} (event_id={event_id})"
+            )
+
+            lookup_id = msg.lookup_id
+            receiver_id = msg.receiver_id
+            remote_mem_indexes = msg.mem_indexes
+            keys = [CacheEngineKey.from_string(key) for key in msg.keys]
+            
+            # Validate input lists have consistent lengths
+            if len(keys) != len(remote_mem_indexes):
+                error_msg = (
+                    f"Inconsistent list lengths in BatchedLookupAndGetMsg: "
+                    f"keys={len(keys)}, mem_indexes={len(remote_mem_indexes)}"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            # Look up keys in local storage
+            num_hit_chunks = await self.local_cpu_backend.batched_async_contains(
+                lookup_id=lookup_id,
+                keys=keys,
+                pin=True,
+            )
+
+            # Retrieve the KV cache data from local storage
+            mem_objs = await self.local_cpu_backend.batched_get_non_blocking(
+                lookup_id=lookup_id,
+                keys=keys[:num_hit_chunks],
+            )
+
+            # Transfer data to the requesting peer node
+            channel_transfer_spec = {
+                "receiver_id": receiver_id,
+                "remote_indexes": remote_mem_indexes[:num_hit_chunks],
+            }
+            await self.transfer_channel.async_batched_write(
+                objects=mem_objs,
+                transfer_spec=channel_transfer_spec,
+            )
+
+            ret_msg = BatchedLookupAndGetRetMsg(
+                event_id=event_id,
+                num_hit_chunks=num_hit_chunks,
+            )
+
+            # Clean up memory references
+            for mem_obj in mem_objs:
+                mem_obj.ref_count_down()
+                mem_obj.unpin()
+
+            return ret_msg
+
+        elif isinstance(msg, BatchedLookupAndPutMsg):
+            # Handle PUT request from a peer node
+            event_id = msg.event_id
+            logger.info(
+                f"Received KV transfer batched PUT request from sender "
+                f"{msg.sender_id} (event_id={event_id})"
+            )
+
+            sender_id = msg.sender_id
+            r_mem_indexes = msg.mem_indexes
+            keys = [CacheEngineKey.from_string(key) for key in msg.keys]
+            offsets = msg.offsets
+            
+            # Validate input lists have consistent lengths
+            if not (len(keys) == len(r_mem_indexes) == len(offsets)):
+                error_msg = (
+                    f"Inconsistent list lengths in BatchedLookupAndPutMsg: "
+                    f"keys={len(keys)}, mem_indexes={len(r_mem_indexes)}, "
+                    f"offsets={len(offsets)}"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            # Filter out keys that already exist locally
+            r_mem_indexes_to_read = []
+            keys_to_read = []
+            local_mem_objs = []
+            for idx, key in enumerate(keys):
+                if self.local_cpu_backend.contains(key, pin=False):
+                    logger.debug(f"Key {key} already exists locally, skipping")
+                    continue
+                
+                # Allocate memory for incoming data
+                r_mem_indexes_to_read.append(r_mem_indexes[idx])
+                shape = self.full_size_shape.copy()
+                shape[self.fmt.token_dim()] = offsets[idx]
+                local_mem_obj = self.local_cpu_backend.allocate(
+                    torch.Size(shape), self.dtype, self.fmt
+                )
+                local_mem_objs.append(local_mem_obj)
+                keys_to_read.append(key)
+
+            # Receive data from the sending peer node
+            channel_transfer_spec = {
+                "sender_id": sender_id,
+                "remote_indexes": r_mem_indexes_to_read,
+            }
+            await self.transfer_channel.async_batched_read(
+                buffers=local_mem_objs,
+                transfer_spec=channel_transfer_spec,
+            )
+
+            # Store received data in local backend
+            self.local_cpu_backend.batched_submit_put_task(
+                keys=keys_to_read,
+                memory_objs=local_mem_objs,
+            )
+
+            return BatchedLookupAndPutRetMsg(
+                event_id=event_id,
+                num_read_chunks=len(local_mem_objs),
+            )
+
+        else:
+            raise ValueError(f"Unsupported KvTransferMsg type: {type(msg)}")
+
+    async def _ensure_peer_connection(
+        self,
+        peer_init_url: str,
+    ) -> None:
+        """
+        Establish connection to an arbitrary peer node if not connected.
+        
+        Args:
+            peer_init_url: The initialization URL (ZMQ port) of the peer
+                          Format: "host:port" (e.g., "192.168.1.100:5555")
+        """
+        # Fast path: Check if connection already exists (connection reuse)
+        # This check is outside the lock for better performance
+        if peer_init_url in self.connected_peers:
+            # Update last used time
+            self.peer_last_used_time[peer_init_url] = time.time()
+            # Move to end for LRU tracking (most recently used)
+            self.connected_peers.move_to_end(peer_init_url)
+            logger.info(
+                f"Reusing existing connection to peer {peer_init_url} "
+            )
+            return
+        
+        # Get or create a lock for this specific peer to prevent concurrent
+        # connection attempts to the same peer
+        async with self._peer_connection_locks_lock:
+            if peer_init_url not in self._peer_connection_locks:
+                self._peer_connection_locks[peer_init_url] = asyncio.Lock()
+            peer_lock = self._peer_connection_locks[peer_init_url]
+        
+        # Acquire the peer-specific lock to ensure only one coroutine
+        # establishes the connection
+        async with peer_lock:
+            # Double-check after acquiring the lock (another coroutine may have
+            # established the connection while we were waiting for the lock)
+            if peer_init_url in self.connected_peers:
+                # Update last used time
+                self.peer_last_used_time[peer_init_url] = time.time()
+                # Move to end for LRU tracking (most recently used)
+                self.connected_peers.move_to_end(peer_init_url)
+                logger.info(
+                    f"Reusing existing connection to peer {peer_init_url} "
+                    "(established by another coroutine)"
+                )
+                return
+            
+            # Check if nixl connection already exists in transfer channel
+            # This can happen if the ZMQ socket was closed but nixl connection remains
+            if peer_init_url in self.transfer_channel.remote_xfer_handlers_dict:
+                logger.warning(
+                    f"Nixl connection to peer {peer_init_url} already exists in "
+                    "transfer channel but not in local mapping. This indicates "
+                    "a state inconsistency. Skipping nixl re-initialization."
+                )
+                del self.transfer_channel.remote_xfer_handlers_dict[peer_init_url]
+                logger.info(
+                    f"Removed stale nixl connection for {peer_init_url}, "
+                    "proceeding with full re-initialization"
+                )
+            
+            # Check connection pool limit before creating new connection
+            if len(self.connected_peers) >= self.max_connections:
+                await self._evict_lru_connection()
+                logger.info(
+                    "Connection pool full (%d), evicted LRU connection "
+                    "before connecting to %s",
+                    self.max_connections,
+                    peer_init_url,
+                )
+            
+            logger.info(
+                "Establishing new nixl connection to peer node "
+                f"at ZMQ port {peer_init_url}"
+            )
+                
+            # Initialize nixl connection with the peer node
+            # This establishes the RDMA/TCP data transfer channel
+            init_side_msg = KvTransferInitSideMsg()
+            await self.transfer_channel.async_lazy_init_peer_connection(
+                local_id=self.local_init_url,
+                peer_id=peer_init_url,
+                peer_init_url=peer_init_url,
+                init_side_msg=init_side_msg,
+            )
+            
+            # Mark peer as connected
+            self.connected_peers[peer_init_url] = True
+            
+            # Initialize last used time
+            self.peer_last_used_time[peer_init_url] = time.time()
+
+            # Create ZMQ DEALER socket for control plane communication with this peer
+            # DEALER allows concurrent requests without blocking
+            lookup_socket = get_zmq_socket(
+                self.async_context,
+                peer_init_url,
+                "tcp",
+                zmq.DEALER,
+                "connect",
+            )
+            self.peer_to_socket_mapping[peer_init_url] = lookup_socket
+            
+            # Start background task to receive responses for this peer
+            asyncio.create_task(
+                self._receive_responses_from_peer(peer_init_url, lookup_socket)
+            )
+            
+            # Update statistics
+            self.connection_pool_stats["total_connections_created"] += 1
+            
+            logger.info(
+                "Successfully established reusable connection to peer %s (pool size: %d/%d)",
+                peer_init_url,
+                len(self.connected_peers),
+                self.max_connections,
+            )
+
+    async def _receive_responses_from_peer(
+        self,
+        peer_init_url: str,
+        socket: zmq.Socket,
+    ) -> None:
+        """
+        Background task to receive responses from a peer and dispatch to pending requests.
+        
+        This enables lock-free concurrent requests by matching responses to requests
+        via event_id.
+        
+        Args:
+            peer_init_url: The peer's init URL (for logging)
+            socket: The DEALER socket connected to the peer
+        """
+        logger.info(f"Starting response receiver for peer {peer_init_url}")
+        
+        while self.running and peer_init_url in self.connected_peers:
+            try:
+                # DEALER receives: [empty_frame, message]
+                frames = await socket.recv_multipart()
+                if len(frames) < 1:
+                    logger.warning(f"Received empty response from peer {peer_init_url}")
+                    continue
+                
+                resp_bytes = frames[-1]
+                resp = msgspec.msgpack.decode(resp_bytes, type=KvTransferMsg)
+                
+                # Extract event_id from response
+                event_id = resp.event_id
+                
+                # Find and complete the pending request
+                async with self._pending_requests_lock:
+                    if event_id in self.pending_requests:
+                        future = self.pending_requests.pop(event_id)
+                        future.set_result(resp)
+                        logger.debug(f"Dispatched response for event_id={event_id}")
+                    else:
+                        logger.warning(
+                            f"Received response for unknown event_id={event_id} "
+                            f"from peer {peer_init_url}"
+                        )
+                        
+            except asyncio.CancelledError:
+                logger.info(f"Response receiver for peer {peer_init_url} cancelled")
+                break
+            except Exception as e:
+                if self.running and peer_init_url in self.connected_peers:
+                    logger.error(
+                        f"Error receiving response from peer {peer_init_url}: {e}"
+                    )
+                    await asyncio.sleep(0.01)
+                else:
+                    break
+        
+        logger.info(f"Response receiver for peer {peer_init_url} stopped")
+
+    async def _send_request_and_wait(
+        self,
+        peer_init_url: str,
+        event_id: str,
+        msg: KvTransferMsg,
+    ) -> KvTransferMsg:
+        """
+        Send a request to a peer and wait for the response (lock-free).
+        
+        Args:
+            peer_init_url: The peer's init URL
+            event_id: Unique identifier for this request
+            msg: The message to send
+            
+        Returns:
+            The response message
+        """
+        # Create a future for this request
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        
+        async with self._pending_requests_lock:
+            self.pending_requests[event_id] = future
+        
+        try:
+            # Get the socket for this peer
+            socket = self.peer_to_socket_mapping[peer_init_url]
+            
+            # Send the request via DEALER socket
+            await socket.send_multipart([
+                b"",
+                msgspec.msgpack.encode(msg)
+            ])
+            
+            # Wait for the response (handled by _receive_responses_from_peer)
+            return await future
+            
+        except Exception as e:
+            # Clean up on error
+            async with self._pending_requests_lock:
+                self.pending_requests.pop(event_id, None)
+            raise e
+
+    async def _evict_lru_connection(self) -> bool:
+        """
+        Evict the least recently used (LRU) connection from the pool.
+        
+        This method is called when the connection pool reaches its maximum size
+        and a new connection needs to be established. It removes the connection
+        that was used least recently.
+        
+        Returns:
+            True if a connection was evicted, False if pool was empty
+        """
+        if not self.connected_peers:
+            logger.warning("Cannot evict from empty connection pool")
+            return False
+        
+        # Get the least recently used peer (first item in OrderedDict)
+        lru_peer_init_url = next(iter(self.connected_peers))
+        
+        last_used = self.peer_last_used_time.get(lru_peer_init_url, 0)
+        logger.info(
+            "Evicting LRU connection to peer %s (last used: %.1fs ago)",
+            lru_peer_init_url,
+            time.time() - last_used,
+        )
+        
+        # Close the connection
+        self._close_peer_connection_internal(lru_peer_init_url)
+        
+        # Update statistics
+        self.connection_pool_stats["lru_evictions"] += 1
+        
+        return True
+    
+    async def _connection_cleanup_task(self) -> None:
+        """
+        Background task that periodically cleans up idle connections.
+        
+        This task runs at regular intervals (cleanup_interval_seconds) and
+        closes connections that have been idle for longer than idle_timeout_seconds.
+        """
+        logger.info(
+            f"Starting connection cleanup task "
+            f"(interval: {self.cleanup_interval_seconds}s, "
+            f"idle_timeout: {self.idle_timeout_seconds}s)"
+        )
+        
+        while self.running:
+            try:
+                await asyncio.sleep(self.cleanup_interval_seconds)
+                
+                if not self.running:
+                    break
+                
+                current_time = time.time()
+                idle_peers = []
+                
+                # Find all idle connections
+                for peer_init_url, last_used_time in self.peer_last_used_time.items():
+                    idle_duration = current_time - last_used_time
+                    if idle_duration > self.idle_timeout_seconds:
+                        idle_peers.append((peer_init_url, idle_duration))
+                
+                # Close idle connections
+                if idle_peers:
+                    logger.info(
+                        "Cleaning up %d idle connections (idle > %ds)",
+                        len(idle_peers),
+                        self.idle_timeout_seconds,
+                    )
+                    
+                    for peer_init_url, idle_duration in idle_peers:
+                        logger.debug(
+                            f"Closing idle connection to {peer_init_url} "
+                            f"(idle for {idle_duration:.1f}s)"
+                        )
+                        self._close_peer_connection_internal(peer_init_url)
+                        self.connection_pool_stats["idle_timeouts"] += 1
+                    
+                    logger.info(
+                        "Connection pool after cleanup: %d/%d (stats: %s)",
+                        len(self.connected_peers),
+                        self.max_connections,
+                        self.connection_pool_stats,
+                    )
+                
+            except Exception as e:
+                logger.error(f"Error in connection cleanup task: {e}", exc_info=True)
+        
+        logger.info("Connection cleanup task stopped")
+
+    async def connect_to_peer(
+        self,
+        peer_ip: str,
+        peer_init_port: int,
+    ) -> bool:
+        """
+        Establish connection to a peer node by IP and ports.
+        
+        The connection will be cached and reused for all subsequent transfers.
+        
+        Args:
+            peer_ip: IP address of the target peer (e.g., "192.168.1.100")
+            peer_init_port: Initialization port of the target peer (e.g., 5555)
+        
+        Returns:
+            True if connection was established or already exists, False on failure
+        """
+        # Construct URLs from IP and ports
+        peer_init_url = f"{peer_ip}:{peer_init_port}"
+        
+        return await self.connect_to_peer_by_zmq_port(
+            peer_init_url=peer_init_url,
+        )
+
+    async def connect_to_peer_by_zmq_port(
+        self,
+        peer_init_url: str,
+    ) -> bool:
+        try:
+            await self._ensure_peer_connection(peer_init_url)
+            logger.info(f"Successfully connected to peer at {peer_init_url}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to peer at {peer_init_url}: {e}")
+            return False
+
+    async def batched_get_non_blocking(
+        self,
+        lookup_id: str,
+        keys: list[CacheEngineKey],
+        transfer_spec: Any = None,
+        event_id: str = "",
+    ) -> list[MemoryObj]:
+        """
+        Retrieve KV cache data from an arbitrary peer node.
+        Supports fetching data from any node in the cluster with connection reuse.
+        
+        Args:
+            lookup_id: Unique identifier for this lookup operation
+            keys: List of cache keys to retrieve
+            transfer_spec: Transfer specification containing chunk lengths
+            event_id: Optional event ID for request correlation (auto-generated if empty)
+            
+        Returns:
+            List of memory objects containing the retrieved KV cache data
+        """
+        # Get peer information from the lookup mapping
+        peer_init_url, location = self.lookup_id_to_peer_mapping.pop(lookup_id)
+        logger.info(
+            f"Retrieving {len(keys)} keys from peer node {peer_init_url} "
+            f"(location: {location}, connection reused)"
+        )
+        
+        # Update last used time and move to end (most recently used)
+        self.peer_last_used_time[peer_init_url] = time.time()
+        if peer_init_url in self.connected_peers:
+            self.connected_peers.move_to_end(peer_init_url)
+
+        assert isinstance(transfer_spec, dict)
+        cum_chunk_lengths = transfer_spec.get("cum_chunk_lengths", None)
+        assert cum_chunk_lengths is not None, "cum_chunk_lengths must be provided"
+
+        # Allocate memory for incoming data
+        mem_objs = []
+        str_keys = []
+        for idx, key in enumerate(keys):
+            shape = self.full_size_shape.copy()
+            shape[self.fmt.token_dim()] = (
+                cum_chunk_lengths[idx + 1] - cum_chunk_lengths[idx]
+            )
+            mem_obj = self.local_cpu_backend.allocate(
+                torch.Size(shape), self.dtype, self.fmt
+            )
+            mem_objs.append(mem_obj)
+            str_keys.append(key.to_string())
+
+        local_indexes = self.transfer_channel.get_local_mem_indices(mem_objs)
+
+        # Generate event_id if not provided
+        if not event_id:
+            event_id = f"get_{uuid.uuid4().hex[:8]}"
+
+        # Send GET request to the peer node via ZMQ (control plane)
+        msg = BatchedLookupAndGetMsg(
+            event_id=event_id,
+            lookup_id=lookup_id,
+            receiver_id=self.local_init_url,
+            keys=str_keys,
+            mem_indexes=local_indexes,
+        )
+
+        # Lock-free concurrent request using event_id for correlation
+        try:
+            ret_msg = await self._send_request_and_wait(peer_init_url, event_id, msg)
+            num_hit_chunks = ret_msg.num_hit_chunks
+        except Exception as e:
+            logger.error(
+                f"Failed to retrieve data from peer {peer_init_url}: {e}. "
+                f"Returning empty result."
+            )
+            # Clean up allocated memory on failure
+            for mem_obj in mem_objs:
+                mem_obj.ref_count_down()
+            return []
+
+        logger.info(
+            f"Successfully retrieved {num_hit_chunks}/{len(keys)} chunks "
+            f"from peer {peer_init_url} (event_id={event_id})"
+        )
+
+        # Return hit memory objects and clean up missed ones
+        hit_mem_objs = mem_objs[:num_hit_chunks]
+        for missed_mem_obj in mem_objs[num_hit_chunks:]:
+            missed_mem_obj.ref_count_down()
+        return hit_mem_objs
+
+    async def transfer_to_peer(
+        self,
+        peer_ip: str,
+        peer_init_port: int,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        offsets: Optional[List[int]] = None,
+        event_id: str = "",
+    ) -> int:
+        """
+        Transfer KV cache data to a specific peer node.
+        
+        The connection will be established automatically if not already connected,
+        and will be reused for subsequent transfers.
+        
+        Args:
+            peer_ip: IP address of the target peer (e.g., "192.168.1.100")
+            peer_init_port: Initialization port of the target peer (e.g., 5555)
+            keys: List of cache keys to transfer
+            objs: List of memory objects containing the KV cache data
+            offsets: Optional token counts. If None, uses chunk_size.
+            event_id: Optional event ID for request correlation (auto-generated if empty)
+        
+        Returns:
+            Number of chunks successfully transferred to the peer
+        """
+        peer_init_url = f"{peer_ip}:{peer_init_port}"
+        
+        if offsets is None:
+            offsets = [self.chunk_size] * len(keys)
+        
+        transfer_spec = {
+            "peer_init_url": peer_init_url,
+            "offsets": offsets,
+            "event_id": event_id,
+        }
+        
+        return await self.async_batched_submit_put_task(
+            keys=keys,
+            objs=objs,
+            transfer_spec=transfer_spec,
+        )
+
+    async def async_batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> int:
+        """
+        Send KV cache data to an arbitrary peer node (PUT operation).
+        
+        Args:
+            keys: List of cache keys to send
+            objs: List of memory objects containing the KV cache data
+            transfer_spec: Dictionary containing:
+                - peer_init_url: The ZMQ URL of the target peer
+                - offsets: Token counts for each chunk
+                - event_id: Optional event ID for request correlation
+                
+        Returns:
+            Number of chunks successfully transferred to the peer
+        """
+        # Code path for `move` operation in controller.
+        assert isinstance(transfer_spec, dict)
+        assert "peer_init_url" in transfer_spec
+        assert "offsets" in transfer_spec
+
+        peer_init_url = transfer_spec["peer_init_url"]
+        offsets = transfer_spec["offsets"]
+        event_id = transfer_spec.get("event_id", "")
+
+        # Establish connection to target peer (reuses existing connection if available)
+        await self._ensure_peer_connection(peer_init_url)
+
+        str_keys = [key.to_string() for key in keys]
+        local_indexes = self.transfer_channel.get_local_mem_indices(objs)
+
+        # Generate event_id if not provided
+        if not event_id:
+            event_id = f"put_{uuid.uuid4().hex[:8]}"
+
+        # Prepare PUT message with transfer metadata
+        msg = BatchedLookupAndPutMsg(
+            event_id=event_id,
+            sender_id=self.local_init_url,
+            keys=str_keys,
+            offsets=offsets,
+            mem_indexes=local_indexes,
+        )
+
+        # Update last used time and move to end (most recently used)
+        self.peer_last_used_time[peer_init_url] = time.time()
+        if peer_init_url in self.connected_peers:
+            self.connected_peers.move_to_end(peer_init_url)
+
+        logger.info(
+                f"Sending {len(keys)} chunks to peer {peer_init_url} (event_id={event_id})"
+            )
+
+        try:
+            # Lock-free concurrent request using event_id for correlation
+            ret_msg = await self._send_request_and_wait(peer_init_url, event_id, msg)
+            
+            logger.info(
+                f"Successfully sent {ret_msg.num_read_chunks}/{len(keys)} chunks "
+                f"to peer {peer_init_url} (event_id={event_id})"
+            )
+            return ret_msg.num_read_chunks
+        except Exception as e:
+            logger.error(
+                f"Failed to send data to peer {peer_init_url}: {e}. "
+                f"Transfer aborted."
+            )
+            return 0
+
+    async def direct_kv_transfer(
+        self,
+        source_peer_init_url: str,
+        target_peer_init_url: str,
+        keys: List[CacheEngineKey],
+        offsets: Optional[List[int]] = None,
+    ) -> int:
+        """
+        Facilitate direct KV cache transfer between two arbitrary peer nodes.
+        
+        This method orchestrates a transfer where data flows directly from source
+        peer to target peer. The current node acts as a coordinator, instructing
+        the source to send data to the target.
+        
+        Args:
+            source_peer_init_url: The peer node that has the data
+            target_peer_init_url: The peer node that should receive the data
+            keys: List of cache keys to transfer
+            offsets: Optional list of token counts for each chunk
+            
+        Returns:
+            Number of keys successfully transferred
+            
+        Workflow:
+            1. Ensure connections to both source and target peers
+            2. Query source peer to verify it has the data
+            3. Instruct source peer to send data directly to target peer
+            4. Target peer receives and stores the data
+        """
+        logger.info(
+            f"Orchestrating direct KV transfer: {len(keys)} keys from "
+            f"{source_peer_init_url} to {target_peer_init_url}"
+        )
+        
+        # Ensure connections to both peers
+        await self._ensure_peer_connection(source_peer_init_url)
+        await self._ensure_peer_connection(target_peer_init_url)
+        
+        # If offsets not provided, use default chunk_size
+        if offsets is None:
+            # Use default chunk_size for all keys
+            offsets = [self.chunk_size] * len(keys)
+            logger.warning(
+                "Offsets not provided for direct KV transfer, "
+                f"using default chunk_size={self.chunk_size}"
+            )
+        
+        # Instruct source peer to send data to target peer
+        # This uses the async_batched_submit_put_task on the source side
+        # Note: This requires the source peer to also be running KvTransferBackend
+        try:
+            # We need to send a message to source peer to initiate transfer
+            # For now, we use a simplified approach: fetch from source and
+            # push to target. A more optimized version would require
+            # protocol extensions
+            
+            logger.info(
+                "Direct KV transfer initiated: fetching from "
+                f"{source_peer_init_url}"
+            )
+            
+            # Step 1: Fetch data from source peer
+            lookup_id = f"direct_transfer_fetch_{id(keys)}"
+            
+            # Manually set up the peer mapping for batched_get
+            self.lookup_id_to_peer_mapping[lookup_id] = (
+                source_peer_init_url,
+                "cpu",  # Assume CPU location
+            )
+            
+            # Prepare transfer spec for get operation
+            cum_chunk_lengths = [0]
+            for offset in offsets:
+                cum_chunk_lengths.append(cum_chunk_lengths[-1] + offset)
+            
+            get_transfer_spec = {
+                "cum_chunk_lengths": cum_chunk_lengths,
+            }
+            
+            mem_objs = await self.batched_get_non_blocking(
+                lookup_id=lookup_id,
+                keys=keys,
+                transfer_spec=get_transfer_spec,
+            )
+            
+            if not mem_objs:
+                logger.error(
+                    f"Failed to fetch data from source peer {source_peer_init_url}"
+                )
+                return 0
+            
+            logger.info(
+                f"Direct KV transfer: pushing {len(mem_objs)} chunks to "
+                f"{target_peer_init_url}"
+            )
+            
+            # Step 2: Push data to target peer
+            put_transfer_spec = {
+                "peer_init_url": target_peer_init_url,
+                "offsets": offsets[:len(mem_objs)],
+            }
+            
+            num_transferred = await self.async_batched_submit_put_task(
+                keys=keys[:len(mem_objs)],
+                objs=mem_objs,
+                transfer_spec=put_transfer_spec,
+            )
+            
+            # Clean up memory objects
+            for mem_obj in mem_objs:
+                mem_obj.ref_count_down()
+            
+            logger.info(
+                f"Direct KV transfer completed: {num_transferred}/{len(keys)} keys "
+                f"transferred from {source_peer_init_url} to {target_peer_init_url}"
+            )
+            
+            return num_transferred
+            
+        except Exception as e:
+            logger.error(
+                f"Direct KV transfer failed: {e}"
+            )
+            return 0
+    
+    def get_connected_peers(self) -> List[str]:
+        return list(self.connected_peers.keys())
+    
+    def is_peer_connected(self, peer_init_url: str) -> bool:
+        return peer_init_url in self.connected_peers
+    
+    def get_connection_info(self, peer_init_url: str) -> Optional[dict[str, str]]:
+        if peer_init_url not in self.connected_peers:
+            return None
+        
+        return {
+            "peer_init_url": peer_init_url,
+            "has_socket": peer_init_url in self.peer_to_socket_mapping,
+            "has_nixl_connection": (
+                peer_init_url
+                in self.transfer_channel.remote_xfer_handlers_dict
+            ),
+        }
+    
+    def get_all_connections_info(self) -> dict[str, dict[str, str]]:
+        return {
+            peer_init_url: self.get_connection_info(peer_init_url)
+            for peer_init_url in self.get_connected_peers()
+        }
+    
+    def get_connection_pool_stats(self) -> dict:
+        return {
+            "current_connections": len(self.connected_peers),
+            "max_connections": self.max_connections,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "cleanup_interval_seconds": self.cleanup_interval_seconds,
+            **self.connection_pool_stats,
+        }
+    
+    def get_connection_idle_times(self) -> dict[str, float]:
+        current_time = time.time()
+        return {
+            peer_init_url: current_time - last_used_time
+            for peer_init_url, last_used_time in self.peer_last_used_time.items()
+        }
+    
+    async def cleanup_idle_connections_now(self) -> int:
+        current_time = time.time()
+        idle_peers = []
+        
+        # Find all idle connections
+        for peer_init_url, last_used_time in self.peer_last_used_time.items():
+            idle_duration = current_time - last_used_time
+            if idle_duration > self.idle_timeout_seconds:
+                idle_peers.append(peer_init_url)
+        
+        # Close idle connections
+        for peer_init_url in idle_peers:
+            self._close_peer_connection_internal(peer_init_url)
+            self.connection_pool_stats["idle_timeouts"] += 1
+        
+        if idle_peers:
+            logger.info(
+                "Manual cleanup: closed %d idle connections (pool size: %d/%d)",
+                len(idle_peers),
+                len(self.connected_peers),
+                self.max_connections,
+            )
+        
+        return len(idle_peers)
+    
+    def set_connection_pool_config(
+        self,
+        max_connections: Optional[int] = None,
+        idle_timeout_seconds: Optional[float] = None,
+    ) -> None:
+        if max_connections is not None:
+            old_max = self.max_connections
+            self.max_connections = max_connections
+            logger.info(
+                "Updated max_connections: %d -> %d", old_max, max_connections
+            )
+        
+        if idle_timeout_seconds is not None:
+            old_timeout = self.idle_timeout_seconds
+            self.idle_timeout_seconds = idle_timeout_seconds
+            logger.info(
+                "Updated idle_timeout_seconds: %.1f -> %.1f",
+                old_timeout,
+                idle_timeout_seconds,
+            )
+    
+    async def broadcast_to_peers(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        target_peer_urls: Optional[List[str]] = None,
+        offsets: Optional[List[int]] = None,
+    ) -> dict[str, int]:
+        if target_peer_urls is None:
+            target_peer_urls = self.get_connected_peers()
+        
+        if not target_peer_urls:
+            logger.warning("No target peers for broadcast")
+            return {}
+        
+        if offsets is None:
+            offsets = [self.chunk_size] * len(keys)
+        
+        logger.info(
+            f"Broadcasting {len(keys)} keys to {len(target_peer_urls)} peers"
+        )
+        
+        # Create transfer tasks for all target peers
+        transfer_tasks = []
+        for peer_url in target_peer_urls:
+            transfer_spec = {
+                "peer_init_url": peer_url,
+                "offsets": offsets,
+            }
+            task = self.async_batched_submit_put_task(
+                keys=keys,
+                objs=objs,
+                transfer_spec=transfer_spec,
+            )
+            transfer_tasks.append((peer_url, task))
+        
+        # Execute all transfers in parallel
+        results = {}
+        for peer_url, task in transfer_tasks:
+            try:
+                num_transferred = await task
+                results[peer_url] = num_transferred
+                logger.info(
+                    f"Broadcast to {peer_url}: {num_transferred}/{len(keys)} chunks"
+                )
+            except Exception as e:
+                logger.error(f"Broadcast to {peer_url} failed: {e}")
+                results[peer_url] = 0
+        
+        total_success = sum(results.values())
+        logger.info(
+            f"Broadcast completed: {total_success} total chunks transferred "
+            f"across {len(target_peer_urls)} peers"
+        )
+        
+        return results
+    
+    async def fetch_from_any_peer(
+        self,
+        keys: List[CacheEngineKey],
+        preferred_peers: Optional[List[str]] = None,
+    ) -> tuple[List[MemoryObj], str]:
+        """
+        Fetch KV cache data from any available peer that has it.
+        
+        This method tries to fetch data from preferred peers first, then falls back
+        to querying the controller to find which peer has the data.
+        
+        Args:
+            keys: List of cache keys to fetch
+            preferred_peers: Optional list of peer_init_urls to try first
+            
+        Returns:
+            Tuple of (list of memory objects, peer_init_url that provided the data)
+            Returns ([], "") if data not found on any peer
+        """
+        logger.info(f"Attempting to fetch {len(keys)} keys from any available peer")
+        
+        # Try preferred peers first if specified
+        if preferred_peers:
+            for peer_url in preferred_peers:
+                if not self.is_peer_connected(peer_url):
+                    try:
+                        await self._ensure_peer_connection(peer_url)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to connect to preferred peer "
+                            f"{peer_url}: {e}"
+                        )
+                        continue
+                
+                # Try to fetch from this peer
+                lookup_id = f"fetch_any_{id(keys)}_{peer_url}"
+                self.lookup_id_to_peer_mapping[lookup_id] = (
+                    peer_url,
+                    "cpu",
+                )
+                
+                # Prepare transfer spec
+                cum_chunk_lengths = [0] + [
+                    (i + 1) * self.chunk_size for i in range(len(keys))
+                ]
+                transfer_spec = {"cum_chunk_lengths": cum_chunk_lengths}
+                
+                try:
+                    mem_objs = await self.batched_get_non_blocking(
+                        lookup_id=lookup_id,
+                        keys=keys,
+                        transfer_spec=transfer_spec,
+                    )
+                    if mem_objs:
+                        logger.info(
+                            f"Successfully fetched {len(mem_objs)} chunks from "
+                            f"preferred peer {peer_url}"
+                        )
+                        return mem_objs, peer_url
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to fetch from preferred peer "
+                        f"{peer_url}: {e}"
+                    )
+        
+        # No preferred peers succeeded, return empty
+        logger.warning("Keys not found on any preferred peer")
+        return [], ""
+    
+    def get_allocator_backend(self):
+        return self.local_cpu_backend
+    
+    def _close_peer_connection_internal(self, peer_init_url: str) -> bool:
+        """
+        Internal method to close a peer connection without logging warnings.
+        Used by cleanup tasks and LRU eviction.
+        
+        Args:
+            peer_init_url: The initialization URL of the peer to disconnect from
+            
+        Returns:
+            True if connection was closed, False if peer was not connected
+        """
+        if peer_init_url not in self.connected_peers:
+            return False
+        
+        # Remove peer from connected set first to stop response receiver
+        del self.connected_peers[peer_init_url]
+        
+        # Close ZMQ socket (this will also cause the response receiver to exit)
+        if peer_init_url in self.peer_to_socket_mapping:
+            socket = self.peer_to_socket_mapping[peer_init_url]
+            try:
+                socket.close()
+            except Exception as e:
+                logger.debug(f"Error closing socket for {peer_init_url}: {e}")
+            del self.peer_to_socket_mapping[peer_init_url]
+        
+        # Remove last used time
+        if peer_init_url in self.peer_last_used_time:
+            del self.peer_last_used_time[peer_init_url]
+        
+        # Clean up nixl connection in transfer channel to prevent state inconsistency
+        # This ensures that when we reconnect, we don't have stale nixl handlers
+        if peer_init_url in self.transfer_channel.remote_xfer_handlers_dict:
+            del self.transfer_channel.remote_xfer_handlers_dict[peer_init_url]
+            logger.debug(
+                f"Removed nixl connection handler for peer {peer_init_url}"
+            )
+        
+        # Update statistics
+        self.connection_pool_stats["total_connections_closed"] += 1
+        
+        return True
+
+    def close_peer_connection(self, peer_init_url: str) -> bool:
+        if peer_init_url not in self.connected_peers:
+            logger.warning(f"Peer {peer_init_url} is not connected")
+            return False
+        
+        logger.info(f"Manually closing connection to peer {peer_init_url}")
+        result = self._close_peer_connection_internal(peer_init_url)
+        
+        if result:
+            logger.info(
+                "Closed connection to peer %s (pool size: %d/%d)",
+                peer_init_url,
+                len(self.connected_peers),
+                self.max_connections,
+            )
+        
+        return result
+
+    def close(
+        self,
+    ) -> None:
+        """
+        Close the KvTransfer Backend and cleanup all resources.
+        
+        This stops the request handler and closes all peer connections.
+        All cached connections (ZMQ sockets and nixl connections) are cleaned up.
+        """
+        self.running = False
+        
+        # Cancel all pending requests
+        for event_id, future in self.pending_requests.items():
+            if not future.done():
+                future.cancel()
+        self.pending_requests.clear()
+        
+        # Clear connected peers first (stops response receivers)
+        self.connected_peers.clear()
+        
+        # Close all peer sockets
+        for socket in self.peer_to_socket_mapping.values():
+            socket.close()
+        self.peer_to_socket_mapping.clear()
+        
+        # Close the server socket
+        if hasattr(self, 'async_peer_socket'):
+            self.async_peer_socket.close()
+        
+        # Close the transfer channel (cleans up nixl connections)
+        if hasattr(self, 'transfer_channel'):
+            self.transfer_channel.close()
+        
+        logger.info(
+            "KvTransfer Backend closed successfully, all connections cleaned up"
+        )
+
+    ############################################################
+    # Not-supported functions
+    ############################################################
+
+    # NOTE: synchronous contain is not supported for now.
+    def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
+        return False
+
+    # NOTE: put-related functions are not supported for now.
+    def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+        raise NotImplementedError
+
+    def batched_submit_put_task(
+        self,
+        keys: Sequence[CacheEngineKey],
+        objs: List[MemoryObj],
+        transfer_spec: Any = None,
+    ) -> None:
+        pass
+
+    # NOTE: Synchronous get is not supported for now.
+    def get_blocking(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[MemoryObj]:
+        raise NotImplementedError
+
+    # NOTE: pin is useless for KvTransfer Backend now.
+    def pin(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        return False
+
+    # NOTE: unpin is useless for KvTransfer Backend now.
+    def unpin(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        return False
+
+    # NOTE: remove is useless for KvTransfer Backend now.
+    def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        return False

@@ -49,6 +49,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
+        global_kvclient: Optional[Any] = None,
     ):
         if torch.cuda.is_available():
             super().__init__(dst_device)
@@ -69,6 +70,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             else memory_allocator
         )
         self.lmcache_worker = lmcache_worker
+        self.global_kvclient = global_kvclient
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
 
@@ -282,6 +284,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 op_type=OpType.EVICT,
                 key=key.chunk_hash,
             )
+
+        if self.global_kvclient is not None:
+            try:
+                key_bytes = key.chunk_hash.to_bytes(32, "big")
+                success = self.global_kvclient.remove_kv_meta([key_bytes])
+                if not success:
+                    logger.warning("Failed to remove kv meta for key: %s", key)
+            except Exception as e:
+                logger.error("Error calling remove_kv_meta: %s", e)
+
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.

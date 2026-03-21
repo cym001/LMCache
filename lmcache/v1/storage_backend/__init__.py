@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from typing import TYPE_CHECKING, AbstractSet, Optional
+from typing import TYPE_CHECKING, AbstractSet, Any, Optional
 import asyncio
 import importlib  # Added for dynamic import
 
@@ -18,6 +18,7 @@ from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 from lmcache.v1.storage_backend.p2p_backend import P2PBackend
 from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+from lmcache.v1.storage_backend.kv_transfer_backend import KvTransferBackend
 
 if TYPE_CHECKING:
     # First Party
@@ -118,6 +119,7 @@ def CreateStorageBackends(
     lmcache_worker: Optional["LMCacheWorker"] = None,
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
+    global_kvclient: Optional[Any] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
     if is_cuda_worker(metadata):
         dst_device = f"cuda:{torch.cuda.current_device()}"
@@ -162,6 +164,7 @@ def CreateStorageBackends(
                 metadata,
                 dst_device,
                 lmcache_worker,
+                global_kvclient=global_kvclient,
             )
             backend_name = str(local_cpu_backend)
             storage_backends[backend_name] = local_cpu_backend
@@ -180,6 +183,25 @@ def CreateStorageBackends(
         )
         backend_name = str(p2p_backend)
         storage_backends[backend_name] = p2p_backend
+
+    if (
+        config.enable_kv_transfer
+        and config.kv_transfer_host is not None
+        and config.kv_transfer_init_ports is not None
+    ):
+        assert local_cpu_backend is not None
+        kv_transfer_backend = KvTransferBackend(
+            config=config,
+            metadata=metadata,
+            loop=loop,
+            local_cpu_backend=local_cpu_backend,
+            max_connections=config.kv_transfer_max_connections,
+            idle_timeout_seconds=config.kv_transfer_idle_timeout_seconds,
+            cleanup_interval_seconds=config.kv_transfer_cleanup_interval_seconds,
+        )
+        backend_name = str(kv_transfer_backend)
+        storage_backends[backend_name] = kv_transfer_backend
+        logger.info(f"Created KvTransferBackend: {backend_name}")
 
     if enable_nixl_storage and "NixlStorageBackend" not in _skip:
         # First Party

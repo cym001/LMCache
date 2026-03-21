@@ -15,6 +15,8 @@ TODO(baoloongmao): Move this to vllm_v1_adapter to decouple from vLLM
 from typing import Any, Iterable, List, Optional, Tuple, Union
 import abc
 import os
+import hashlib
+import struct
 
 # Third Party
 from transformers import AutoTokenizer
@@ -33,6 +35,32 @@ NONE_HASH = 0
 # Type alias for process_tokens return value
 # (start_index, end_index, cache_engine_key｜hash)
 ProcessTokensResult = Tuple[int, int, Union[CacheEngineKey, int]]
+
+
+def sha256_cross_language_hash(
+    tokens: Union[torch.Tensor, List[int]],
+    prefix_hash: Optional[int] = None,
+    extra_keys: Optional[list[Any]] = None, # 当前不用
+) -> int:
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
+
+    # 1. prefix_hash 作为16进制字符串
+    if prefix_hash is None:
+        prefix_bytes = bytes(32)  # 初始为32字节0
+    else:
+        prefix_bytes = prefix_hash.to_bytes(32, "big")  # 固定256bit
+
+    # 2. tokens 转成小端字节序
+    token_bytes = b''.join(int(t).to_bytes(4, "little") for t in tokens)
+
+    # 3. SHA256(prefix_bytes + token_bytes)
+    h = hashlib.sha256(prefix_bytes + token_bytes).digest()
+
+    # 4. 转成 int 返回（Python 默认 big endian）
+    result_hash = int.from_bytes(h, "big")
+
+    return result_hash
 
 
 class TokenDatabase(metaclass=abc.ABCMeta):
@@ -59,7 +87,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         )
 
         # Get hash function with vLLM version compatibility
-        self.hash_func = self._get_vllm_hash_func(hash_algorithm)
+        if hash_algorithm == "sha256_cross_language":
+            # Cross-language consistent SHA256 hash (no external dependencies)
+            self.hash_func = sha256_cross_language_hash
+        else:
+            self.hash_func = self._get_vllm_hash_func(hash_algorithm)
 
         # Initialize NONE_HASH (vLLM >= PR#20511)
         # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is
