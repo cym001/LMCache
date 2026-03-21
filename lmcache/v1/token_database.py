@@ -38,26 +38,23 @@ ProcessTokensResult = Tuple[int, int, Union[CacheEngineKey, int]]
 
 
 def sha256_cross_language_hash(
-    tokens: Union[torch.Tensor, List[int]],
-    prefix_hash: Optional[int] = None,
-    extra_keys: Optional[list[Any]] = None, # 当前不用
+    hash_input: Tuple[int, Tuple[int, ...], Tuple[Any, ...]],
 ) -> int:
+    prefix_hash, tokens, _ = hash_input
+
     if isinstance(tokens, torch.Tensor):
         tokens = tokens.tolist()
 
-    # 1. prefix_hash 作为16进制字符串
-    if prefix_hash is None:
-        prefix_bytes = bytes(32)  # 初始为32字节0
-    else:
-        prefix_bytes = prefix_hash.to_bytes(32, "big")  # 固定256bit
+    # 1. prefix_hash fixed 256-bit bytes
+    prefix_bytes = int(prefix_hash).to_bytes(32, "big")
 
-    # 2. tokens 转成小端字节序
-    token_bytes = b''.join(int(t).to_bytes(4, "little") for t in tokens)
+    # 2. tokens to little-endian uint32 bytes
+    token_bytes = b"".join((int(t) & 0xFFFFFFFF).to_bytes(4, "little") for t in tokens)
 
     # 3. SHA256(prefix_bytes + token_bytes)
     h = hashlib.sha256(prefix_bytes + token_bytes).digest()
 
-    # 4. 转成 int 返回（Python 默认 big endian）
+    # 4. convert digest to int
     result_hash = int.from_bytes(h, "big")
 
     return result_hash

@@ -6,17 +6,17 @@ max_local_cpu_size: 20
 pre_caching_hash_algorithm: "sha256_cross_language"
 
 # P2P configurations
-p2p_host: "localhost"
-p2p_init_ports: 8201
-p2p_lookup_ports: 8202
+# p2p_host: "localhost"
+# p2p_init_ports: 8201
+# p2p_lookup_ports: 8202
 
-enable_kv_transfer: True
-kv_transfer_host: "127.0.0.1"
-kv_transfer_http_ports: 8010
-kv_transfer_init_ports: 8203
-kv_transfer_rpc_ports: 8204
-kv_transfer_model_name: "Meta-Llama-3.1-8B-Instruct"
-transfer_channel: "nixl"
+# enable_kv_transfer: True
+# kv_transfer_host: "127.0.0.1"
+# kv_transfer_http_ports: 8010
+# kv_transfer_init_ports: 8203
+# kv_transfer_rpc_ports: 8204
+# kv_transfer_model_name: "Meta-Llama-3.1-8B-Instruct"
+# transfer_channel: "nixl"
 
 # Controller configurations
 # enable_controller: True
@@ -25,8 +25,8 @@ transfer_channel: "nixl"
 # controller_reply_url: "localhost:8400"
 # lmcache_worker_ports: 8500
 
-enable_globalkv_server: true
-globalkv_server_max_workers: 10
+# enable_globalkv_server: true
+# globalkv_server_max_workers: 10
 
 extra_config:
   lookup_backoff_time: 0.001

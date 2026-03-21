@@ -12,7 +12,7 @@ import torch
 import zmq
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
+from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
@@ -126,7 +126,7 @@ class KvTransferBackend(StorageBackendInterface):
     def __init__(
         self,
         config: LMCacheEngineConfig,
-        metadata: LMCacheEngineMetadata,
+        metadata: LMCacheMetadata,
         loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
         max_connections: int = 100,
