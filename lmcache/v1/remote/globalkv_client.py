@@ -33,11 +33,16 @@ class KvCacheClient:
         self.stub = None
         
         # 数据服务器信息
-        self.data_server_ip = config.kv_transfer_host
-        self.data_server_http_port = config.kv_transfer_http_ports
-        self.data_server_init_port = config.kv_transfer_init_ports
-        self.data_server_rpc_port = config.kv_transfer_rpc_ports
-        self.model_name = config.kv_transfer_model_name
+        # self.data_server_ip = config.kv_transfer_host
+        # self.data_server_http_port = config.kv_transfer_http_ports
+        # self.data_server_init_port = config.kv_transfer_init_ports
+        # self.data_server_rpc_port = config.kv_transfer_rpc_ports
+        # self.model_name = config.kv_transfer_model_name
+        self.data_server_ip = "127.0.0.1"
+        self.data_server_http_port = [8010]
+        self.data_server_init_port = [8203]
+        self.data_server_rpc_port = [8204]
+        self.model_name = "test"
         
         # 生成server_id: ip+http_port的hash值
         id_str = f"{self.data_server_ip}:{self.data_server_http_port}"

@@ -10,6 +10,7 @@ decoupling the vLLM adapter from internal LMCache implementation details.
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import TYPE_CHECKING, Any, Optional, Union
 import time
+import traceback
 
 # Third Party
 import torch
@@ -103,9 +104,14 @@ class LMCacheManager:
         except Exception as e:
             self._init_failed = True
             self._init_failed_reason = str(e)
+            error_function = "unknown"
+            extracted_tb = traceback.extract_tb(e.__traceback__)
+            if extracted_tb:
+                error_function = extracted_tb[-1].name
             logger.error(
-                "Failed to initialize LMCacheManager components: %s. "
+                "Failed to initialize LMCacheManager components in function '%s': %s. "
                 "System will operate in degraded mode (recompute).",
+                error_function,
                 e,
             )
 

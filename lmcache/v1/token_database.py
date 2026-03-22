@@ -37,27 +37,27 @@ NONE_HASH = 0
 ProcessTokensResult = Tuple[int, int, Union[CacheEngineKey, int]]
 
 
-def sha256_cross_language_hash(
-    hash_input: Tuple[int, Tuple[int, ...], Tuple[Any, ...]],
-) -> int:
-    prefix_hash, tokens, _ = hash_input
+# def sha256_cross_language_hash(
+#     hash_input: Tuple[int, Tuple[int, ...], Tuple[Any, ...]],
+# ) -> int:
+#     prefix_hash, tokens, _ = hash_input
 
-    if isinstance(tokens, torch.Tensor):
-        tokens = tokens.tolist()
+#     if isinstance(tokens, torch.Tensor):
+#         tokens = tokens.tolist()
 
-    # 1. prefix_hash fixed 256-bit bytes
-    prefix_bytes = int(prefix_hash).to_bytes(32, "big")
+#     # 1. prefix_hash fixed 256-bit bytes
+#     prefix_bytes = int(prefix_hash).to_bytes(32, "big")
 
-    # 2. tokens to little-endian uint32 bytes
-    token_bytes = b"".join((int(t) & 0xFFFFFFFF).to_bytes(4, "little") for t in tokens)
+#     # 2. tokens to little-endian uint32 bytes
+#     token_bytes = b"".join((int(t) & 0xFFFFFFFF).to_bytes(4, "little") for t in tokens)
 
-    # 3. SHA256(prefix_bytes + token_bytes)
-    h = hashlib.sha256(prefix_bytes + token_bytes).digest()
+#     # 3. SHA256(prefix_bytes + token_bytes)
+#     h = hashlib.sha256(prefix_bytes + token_bytes).digest()
 
-    # 4. convert digest to int
-    result_hash = int.from_bytes(h, "big")
+#     # 4. convert digest to int
+#     result_hash = int.from_bytes(h, "big")
 
-    return result_hash
+#     return result_hash
 
 
 class TokenDatabase(metaclass=abc.ABCMeta):
@@ -84,11 +84,13 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         )
 
         # Get hash function with vLLM version compatibility
-        if hash_algorithm == "sha256_cross_language":
-            # Cross-language consistent SHA256 hash (no external dependencies)
-            self.hash_func = sha256_cross_language_hash
-        else:
-            self.hash_func = self._get_vllm_hash_func(hash_algorithm)
+        # if hash_algorithm == "sha256_cross_language":
+        #     # Cross-language consistent SHA256 hash (no external dependencies)
+        #     self.hash_func = sha256_cross_language_hash
+        # else:
+        #     self.hash_func = self._get_vllm_hash_func(hash_algorithm)
+
+        self.hash_func = self._get_vllm_hash_func(hash_algorithm)
 
         # Initialize NONE_HASH (vLLM >= PR#20511)
         # NOTE: For centralized cache sharing, ensure PYTHONHASHSEED is

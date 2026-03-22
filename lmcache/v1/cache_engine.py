@@ -928,7 +928,7 @@ class LMCacheEngine:
             )
 
         # Upload hit KV blocks metadata to metadata server
-        self._upload_hit_kv_metadata(tokens, ret_mask)
+        # self._upload_hit_kv_metadata(tokens, ret_mask)
 
         return ret_mask
 

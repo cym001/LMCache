@@ -8,7 +8,11 @@ import torch
 
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.token_database import ChunkedTokenDatabase, SegmentTokenDatabase
+from lmcache.v1.token_database import (
+    ChunkedTokenDatabase,
+    SegmentTokenDatabase,
+    sha256_cross_language_hash,
+)
 
 # Local
 from .utils import dumb_metadata, dumb_metadata_with_model_name, generate_tokens
@@ -62,6 +66,16 @@ def test_chunked_token_database(chunk_length, save_unfull_chunk):
             st, ed, key = new_results[j]
             assert st == original_results[j + i][0]
             assert ed == original_results[j + i][1]
+
+
+def test_sha256_cross_language_hash_accepts_nested_tuple() -> None:
+    hash_input = (123, (1, 2, 3), ())
+    nested_hash_input = (hash_input,)
+
+    normal_hash = sha256_cross_language_hash(hash_input)
+    nested_hash = sha256_cross_language_hash(nested_hash_input)
+
+    assert normal_hash == nested_hash
 
 
 @pytest.mark.parametrize("prefix_length", [0, 16, 64, 256])
