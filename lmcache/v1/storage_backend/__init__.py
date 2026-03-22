@@ -187,7 +187,7 @@ def CreateStorageBackends(
     # if (
     #     config.enable_kv_transfer
     #     and config.kv_transfer_host is not None
-    #     and config.kv_transfer_init_ports is not None
+    #     and config.kv_transfer_init_port is not None
     # ):
     #     assert local_cpu_backend is not None
     #     kv_transfer_backend = KvTransferBackend(

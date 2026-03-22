@@ -33,16 +33,16 @@ class KvCacheClient:
         self.stub = None
         
         # 数据服务器信息
-        # self.data_server_ip = config.kv_transfer_host
-        # self.data_server_http_port = config.kv_transfer_http_ports
-        # self.data_server_init_port = config.kv_transfer_init_ports
-        # self.data_server_rpc_port = config.kv_transfer_rpc_ports
-        # self.model_name = config.kv_transfer_model_name
-        self.data_server_ip = "127.0.0.1"
-        self.data_server_http_port = [8010]
-        self.data_server_init_port = [8203]
-        self.data_server_rpc_port = [8204]
-        self.model_name = "test"
+        self.data_server_ip = config.kv_transfer_host
+        self.data_server_http_port = config.kv_transfer_http_port
+        self.data_server_init_port = config.kv_transfer_init_port
+        self.data_server_rpc_port = config.kv_transfer_rpc_port
+        self.model_name = config.kv_transfer_model_name
+        # self.data_server_ip = "127.0.0.1"
+        # self.data_server_http_port = [8010]
+        # self.data_server_init_port = [8203]
+        # self.data_server_rpc_port = [8204]
+        # self.model_name = "test"
         
         # 生成server_id: ip+http_port的hash值
         id_str = f"{self.data_server_ip}:{self.data_server_http_port}"
@@ -109,12 +109,12 @@ class KvCacheClient:
         data_server = kvcache_pb2.DataServer(
             id=self.server_id,
             ip=self.data_server_ip,
-            http_port=self.data_server_http_port[0],
-            init_port=self.data_server_init_port[0],
-            rpc_port=self.data_server_rpc_port[0],
+            http_port=self.data_server_http_port,
+            init_port=self.data_server_init_port,
+            rpc_port=self.data_server_rpc_port,
             model_name=self.model_name,
             # url=f"http://localhost:{self.data_server_http_port[0]}/v1/completions"
-            url=f"http://localhost:{self.data_server_http_port[0]}/v1"
+            url=f"http://localhost:{self.data_server_http_port}/v1"
         )
         
         request = kvcache_pb2.RegisterInstanceRequest(

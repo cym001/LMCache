@@ -226,8 +226,8 @@ class LMCacheEngine:
         self.globalkv_server: Optional[GlobalKvServer] = None
         if config.enable_globalkv_server:
             rpc_port = config.globalkv_server_port
-            if config.kv_transfer_rpc_ports:
-                rpc_port = config.kv_transfer_rpc_ports[0]
+            if config.kv_transfer_rpc_port is not None:
+                rpc_port = config.kv_transfer_rpc_port
             self.globalkv_server = GlobalKvServer(
                 cache_engine=self,
                 host=config.globalkv_server_host,
@@ -555,6 +555,8 @@ class LMCacheEngine:
         # Upload KV metadata to metadata server regardless of whether memory_objs is empty
         if self.global_kvclient is not None:
             self.global_kvclient.upload_kv_meta(tokens)
+        else:
+            logger.info("GlobalKVClient is not enabled, skipping upload KV metadata")
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:

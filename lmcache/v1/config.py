@@ -43,6 +43,9 @@ _CONFIG_ALIASES = {
     "nixl_role": "pd_role",
     "controller_url": "controller_pull_url",
     "lmcache_worker_port": "lmcache_worker_ports",
+    "kv_transfer_http_ports": "kv_transfer_http_port",
+    "kv_transfer_init_ports": "kv_transfer_init_port",
+    "kv_transfer_rpc_ports": "kv_transfer_rpc_port",
     "plugin_locations": "runtime_plugin_locations",
     "external_backends": "storage_plugins",
 }
@@ -55,6 +58,15 @@ _DEPRECATED_CONFIGS = {
     ),
     "external_backends": (
         "external_backends is deprecated, use storage_plugins instead"
+    ),
+    "kv_transfer_http_ports": (
+        "kv_transfer_http_ports is deprecated, use kv_transfer_http_port instead"
+    ),
+    "kv_transfer_init_ports": (
+        "kv_transfer_init_ports is deprecated, use kv_transfer_init_port instead"
+    ),
+    "kv_transfer_rpc_ports": (
+        "kv_transfer_rpc_ports is deprecated, use kv_transfer_rpc_port instead"
     ),
 }
 
@@ -378,20 +390,20 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": str,
     },
-    "kv_transfer_http_ports": {
-        "type": Optional[list[int]],
+    "kv_transfer_http_port": {
+        "type": Optional[int],
         "default": None,
-        "env_converter": _to_int_list,
+        "env_converter": int,
     },
-    "kv_transfer_init_ports": {
-        "type": Optional[list[int]],
+    "kv_transfer_init_port": {
+        "type": Optional[int],
         "default": None,
-        "env_converter": _to_int_list,
+        "env_converter": int,
     },
-    "kv_transfer_rpc_ports": {
-        "type": Optional[list[int]],
+    "kv_transfer_rpc_port": {
+        "type": Optional[int],
         "default": None,
-        "env_converter": _to_int_list,
+        "env_converter": int,
     },
     "kv_transfer_model_name": {
         "type": Optional[str],

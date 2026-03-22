@@ -32,10 +32,7 @@ print_launch_banner "Launching Aggregated Serving + LMCache (1 GPU)" "$MODEL" "$
 python -m dynamo.frontend \
   --discovery-backend file &
 
-# -------------------------------
-# ✅ worker（你原来基本是对的）
-# -------------------------------
-DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081} LMCACHE_CONFIG_FILE=/root/LMCache-adapter/LMCache/examples/kv_transfer/example1.yaml \
+DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081} LMCACHE_CONFIG_FILE=/root/LMCache/examples/kv_transfer/example1.yaml \
 python -m dynamo.vllm \
   --model "$MODEL" \
   --enforce-eager \

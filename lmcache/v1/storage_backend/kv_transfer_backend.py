@@ -137,8 +137,8 @@ class KvTransferBackend(StorageBackendInterface):
         assert config.kv_transfer_host is not None, (
             "kv_transfer_host must be specified"
         )
-        assert config.kv_transfer_init_ports is not None, (
-            "kv_transfer_init_ports must be specified"
+        assert config.kv_transfer_init_port is not None, (
+            "kv_transfer_init_port must be specified"
         )
 
         # Current node's worker id
@@ -146,7 +146,7 @@ class KvTransferBackend(StorageBackendInterface):
 
         # Current node's connection information
         self.local_host = config.kv_transfer_host
-        self.local_init_port = config.kv_transfer_init_ports[self.worker_id]
+        self.local_init_port = config.kv_transfer_init_port
         self.local_init_url = f"{self.local_host}:{self.local_init_port}"
 
         # ===== Connection Pool Configuration =====
