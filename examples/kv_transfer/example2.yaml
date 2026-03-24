@@ -3,7 +3,7 @@ local_cpu: True
 max_local_cpu_size: 20
 # enable_async_loading: True
 
-pre_caching_hash_algorithm: "sha256_cross_language"
+pre_caching_hash_algorithm: "sha256_cbor"
 
 # P2P configurations
 # enable_p2p: True

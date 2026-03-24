@@ -2,11 +2,10 @@
 set -e
 trap 'echo Cleaning up...; kill 0' EXIT
 
-# -------------------------------
-# ✅ 关键：关闭 etcd / NATS 依赖
-# -------------------------------
 export DYN_DISCOVERY_BACKEND=file
-export DYN_EVENT_PLANE=zmq
+# export DYN_EVENT_PLANE=zmq
+export NATS_SERVER=nats://127.0.0.1:4222
+export DYN_EVENT_PLANE=nats
 
 # Explicitly unset PROMETHEUS_MULTIPROC_DIR
 unset PROMETHEUS_MULTIPROC_DIR
@@ -26,9 +25,6 @@ GPU_MEM_FRACTION=$(build_gpu_mem_args vllm --model "$MODEL" --max-model-len "$MA
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
 print_launch_banner "Launching Aggregated Serving + LMCache (1 GPU)" "$MODEL" "$HTTP_PORT"
 
-# -------------------------------
-# ✅ frontend（必须加 file backend）
-# -------------------------------
 python -m dynamo.frontend \
   --discovery-backend file &
 
@@ -40,6 +36,7 @@ python -m dynamo.vllm \
   --max-num-seqs "$MAX_CONCURRENT_SEQS" \
   --discovery-backend file \
   ${GPU_MEM_FRACTION:+--gpu-memory-utilization "$GPU_MEM_FRACTION"} \
+  --kv-events-config '{"publisher":"nats","topic":"kv-events","enable_kv_cache_events":true}' \
   --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}' &
 
 # Exit on first worker failure
