@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class KvMeta2DataStub(object):
+class LMCacheGrpcStub(object):
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -34,27 +34,22 @@ class KvMeta2DataStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.UploadKvMeta = channel.unary_unary(
-                '/kvcache.KvMeta2Data/UploadKvMeta',
-                request_serializer=kvcache__pb2.UploadKvMetaRequest.SerializeToString,
-                response_deserializer=kvcache__pb2.UploadKvMetaResponse.FromString,
+        self.TransferKv = channel.unary_unary(
+                '/lmcache.LMCacheGrpc/TransferKv',
+                request_serializer=kvcache__pb2.TransferKvRequest.SerializeToString,
+                response_deserializer=kvcache__pb2.TransferKvResponse.FromString,
                 _registered_method=True)
         self.RegisterInstance = channel.unary_unary(
-                '/kvcache.KvMeta2Data/RegisterInstance',
+                '/lmcache.LMCacheGrpc/RegisterInstance',
                 request_serializer=kvcache__pb2.RegisterInstanceRequest.SerializeToString,
                 response_deserializer=kvcache__pb2.RegisterInstanceResponse.FromString,
                 _registered_method=True)
-        self.RemoveKvMeta = channel.unary_unary(
-                '/kvcache.KvMeta2Data/RemoveKvMeta',
-                request_serializer=kvcache__pb2.RemoveKvMetaRequest.SerializeToString,
-                response_deserializer=kvcache__pb2.RemoveKvMetaResponse.FromString,
-                _registered_method=True)
 
 
-class KvMeta2DataServicer(object):
+class LMCacheGrpcServicer(object):
     """Missing associated documentation comment in .proto file."""
 
-    def UploadKvMeta(self, request, context):
+    def TransferKv(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -66,43 +61,32 @@ class KvMeta2DataServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def RemoveKvMeta(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
 
-
-def add_KvMeta2DataServicer_to_server(servicer, server):
+def add_LMCacheGrpcServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'UploadKvMeta': grpc.unary_unary_rpc_method_handler(
-                    servicer.UploadKvMeta,
-                    request_deserializer=kvcache__pb2.UploadKvMetaRequest.FromString,
-                    response_serializer=kvcache__pb2.UploadKvMetaResponse.SerializeToString,
+            'TransferKv': grpc.unary_unary_rpc_method_handler(
+                    servicer.TransferKv,
+                    request_deserializer=kvcache__pb2.TransferKvRequest.FromString,
+                    response_serializer=kvcache__pb2.TransferKvResponse.SerializeToString,
             ),
             'RegisterInstance': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterInstance,
                     request_deserializer=kvcache__pb2.RegisterInstanceRequest.FromString,
                     response_serializer=kvcache__pb2.RegisterInstanceResponse.SerializeToString,
             ),
-            'RemoveKvMeta': grpc.unary_unary_rpc_method_handler(
-                    servicer.RemoveKvMeta,
-                    request_deserializer=kvcache__pb2.RemoveKvMetaRequest.FromString,
-                    response_serializer=kvcache__pb2.RemoveKvMetaResponse.SerializeToString,
-            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'kvcache.KvMeta2Data', rpc_method_handlers)
+            'lmcache.LMCacheGrpc', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('kvcache.KvMeta2Data', rpc_method_handlers)
+    server.add_registered_method_handlers('lmcache.LMCacheGrpc', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class KvMeta2Data(object):
+class LMCacheGrpc(object):
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def UploadKvMeta(request,
+    def TransferKv(request,
             target,
             options=(),
             channel_credentials=None,
@@ -115,9 +99,9 @@ class KvMeta2Data(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/kvcache.KvMeta2Data/UploadKvMeta',
-            kvcache__pb2.UploadKvMetaRequest.SerializeToString,
-            kvcache__pb2.UploadKvMetaResponse.FromString,
+            '/lmcache.LMCacheGrpc/TransferKv',
+            kvcache__pb2.TransferKvRequest.SerializeToString,
+            kvcache__pb2.TransferKvResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -142,36 +126,9 @@ class KvMeta2Data(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/kvcache.KvMeta2Data/RegisterInstance',
+            '/lmcache.LMCacheGrpc/RegisterInstance',
             kvcache__pb2.RegisterInstanceRequest.SerializeToString,
             kvcache__pb2.RegisterInstanceResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def RemoveKvMeta(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/kvcache.KvMeta2Data/RemoveKvMeta',
-            kvcache__pb2.RemoveKvMetaRequest.SerializeToString,
-            kvcache__pb2.RemoveKvMetaResponse.FromString,
             options,
             channel_credentials,
             insecure,

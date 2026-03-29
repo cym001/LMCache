@@ -22,8 +22,8 @@ if _server_dir not in sys.path:
     sys.path.insert(0, _server_dir)
 
 try:
-    import kvserver_pb2
-    import kvserver_pb2_grpc
+    import lmcache.v1.remote.kvcache_pb2 as kvcache_pb2
+    import lmcache.v1.remote.kvcache_pb2_grpc as kvcache_pb2_grpc
 except ImportError:
     raise ImportError(
         "Failed to import kvserver_pb2 and kvserver_pb2_grpc. "
@@ -37,7 +37,7 @@ from lmcache.logging import init_logger
 logger = init_logger(__name__)
 
 
-class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
+class LmcacheServerServicer(kvcache_pb2_grpc.LMCacheGrpcServicer):
     """
     gRPC service implementation for KV cache transfer operations.
     
@@ -112,24 +112,24 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             # Validate inputs
             if not hashes:
                 logger.warning("TransferKv: No hashes provided")
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvcache_pb2.TransferKvResponse(status=-2)
             
             if not offsets:
                 logger.warning("TransferKv: No offsets provided")
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvcache_pb2.TransferKvResponse(status=-2)
             
             if len(hashes) != len(offsets):
                 logger.warning(
                     f"TransferKv: Mismatch between hashes ({len(hashes)}) "
                     f"and offsets ({len(offsets)})"
                 )
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvcache_pb2.TransferKvResponse(status=-2)
             
             if not target_ip or target_port <= 0:
                 logger.warning(
                     f"TransferKv: Invalid target: {target_ip}:{target_port}"
                 )
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvcache_pb2.TransferKvResponse(status=-2)
             
             # Call the cache engine's kv_transfer method
             # Returns:
@@ -154,13 +154,13 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             # -1: KV cache does not exist
             # -2: Transfer failed for other reasons
             # >0: Number of tokens transferred successfully
-            return kvserver_pb2.TransferKvResponse(status=num_tokens)
+            return kvcache_pb2.TransferKvResponse(status=num_tokens)
             
         except Exception as e:
             logger.error(f"TransferKv failed with exception: {e}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return kvserver_pb2.TransferKvResponse(status=-2)
+            return kvcache_pb2.TransferKvResponse(status=-2)
     
     def _parse_hashes(self, hash_bytes: bytes, num_hashes: int) -> List[int]:
         """
@@ -285,7 +285,7 @@ class GlobalKvServer:
         
         # Create and register the servicer
         servicer = LmcacheServerServicer(self.cache_engine)
-        kvserver_pb2_grpc.add_LmcacheServerServicer_to_server(servicer, self.server)
+        kvcache_pb2_grpc.add_LMCacheGrpcServicer_to_server(servicer, self.server)
         
         # Bind to the specified address and verify binding succeeded
         try:

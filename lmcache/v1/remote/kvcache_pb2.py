@@ -24,41 +24,21 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rkvcache.proto\x12\x07kvcache\"}\n\nDataServer\x12\n\n\x02id\x18\x01 \x01(\r\x12\n\n\x02ip\x18\x02 \x01(\t\x12\x11\n\thttp_port\x18\x03 \x01(\r\x12\x11\n\tinit_port\x18\x04 \x01(\r\x12\x10\n\x08rpc_port\x18\x05 \x01(\r\x12\x12\n\nmodel_name\x18\x06 \x01(\t\x12\x0b\n\x03url\x18\x07 \x01(\t\"5\n\nMetaServer\x12\n\n\x02ip\x18\x01 \x01(\t\x12\x0c\n\x04port\x18\x02 \x01(\r\x12\r\n\x05layer\x18\x03 \x01(\r\"Y\n\x0bKvBlockMeta\x12\x12\n\ntoken_hash\x18\x01 \x01(\x0c\x12\x0e\n\x06offset\x18\x02 \x01(\r\x12\x13\n\x0bnext_tokens\x18\x03 \x03(\x0c\x12\x11\n\tserver_id\x18\x04 \x03(\r\"4\n\x0fLocalBlockCount\x12\x12\n\ntoken_hash\x18\x01 \x01(\x0c\x12\r\n\x05\x63ount\x18\x02 \x01(\x04\"F\n\nUpdateKvOp\x12\x12\n\ntoken_hash\x18\x01 \x01(\x0c\x12\x11\n\toperation\x18\x02 \x01(\r\x12\x11\n\tserver_id\x18\x03 \x01(\r\"\x1d\n\x0bToken_lists\x12\x0e\n\x06tokens\x18\x01 \x03(\r\":\n\nKvBlockPos\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x0b\n\x03url\x18\x02 \x01(\t\x12\x0b\n\x03len\x18\x03 \x01(\r\"6\n\x0cSearchResult\x12&\n\tblock_pos\x18\x01 \x03(\x0b\x32\x13.kvcache.KvBlockPos\"8\n\x13UploadKvMetaRequest\x12\x11\n\tserver_id\x18\x01 \x01(\r\x12\x0e\n\x06tokens\x18\x03 \x03(\r\"\'\n\x14UploadKvMetaResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"C\n\x17RegisterInstanceRequest\x12(\n\x0b\x64\x61ta_server\x18\x01 \x01(\x0b\x32\x13.kvcache.DataServer\"+\n\x18RegisterInstanceResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"K\n\x13RemoveKvMetaRequest\x12\n\n\x02id\x18\x01 \x01(\r\x12\x13\n\x0bremove_nums\x18\x02 \x01(\x05\x12\x13\n\x0btokens_hash\x18\x03 \x03(\x0c\"\'\n\x14RemoveKvMetaResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x32\x80\x02\n\x0bKvMeta2Data\x12K\n\x0cUploadKvMeta\x12\x1c.kvcache.UploadKvMetaRequest\x1a\x1d.kvcache.UploadKvMetaResponse\x12W\n\x10RegisterInstance\x12 .kvcache.RegisterInstanceRequest\x1a!.kvcache.RegisterInstanceResponse\x12K\n\x0cRemoveKvMeta\x12\x1c.kvcache.RemoveKvMetaRequest\x1a\x1d.kvcache.RemoveKvMetaResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\rkvcache.proto\x12\x07lmcache\"|\n\x11TransferKvRequest\x12\x0c\n\x04hash\x18\x01 \x01(\x0c\x12\x10\n\x08position\x18\x02 \x01(\t\x12\x0e\n\x06offset\x18\x03 \x03(\r\x12\x11\n\ttarget_ip\x18\x04 \x01(\t\x12\x13\n\x0btarget_port\x18\x05 \x01(\x05\x12\x0f\n\x07\x64o_copy\x18\x06 \x01(\x08\"$\n\x12TransferKvResponse\x12\x0e\n\x06status\x18\x01 \x01(\x05\"\x8f\x01\n\x17RegisterInstanceRequest\x12\x11\n\tworker_id\x18\x01 \x01(\x04\x12\x0f\n\x07\x64p_rank\x18\x02 \x01(\r\x12\n\n\x02ip\x18\x03 \x01(\t\x12\x11\n\tinit_port\x18\x04 \x01(\r\x12\x10\n\x08rpc_port\x18\x05 \x01(\r\x12\x12\n\nmodel_name\x18\x06 \x01(\t\x12\x0b\n\x03url\x18\x07 \x01(\t\"+\n\x18RegisterInstanceResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x32\xad\x01\n\x0bLMCacheGrpc\x12\x45\n\nTransferKv\x12\x1a.lmcache.TransferKvRequest\x1a\x1b.lmcache.TransferKvResponse\x12W\n\x10RegisterInstance\x12 .lmcache.RegisterInstanceRequest\x1a!.lmcache.RegisterInstanceResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'kvcache_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_DATASERVER']._serialized_start=26
-  _globals['_DATASERVER']._serialized_end=151
-  _globals['_METASERVER']._serialized_start=153
-  _globals['_METASERVER']._serialized_end=206
-  _globals['_KVBLOCKMETA']._serialized_start=208
-  _globals['_KVBLOCKMETA']._serialized_end=297
-  _globals['_LOCALBLOCKCOUNT']._serialized_start=299
-  _globals['_LOCALBLOCKCOUNT']._serialized_end=351
-  _globals['_UPDATEKVOP']._serialized_start=353
-  _globals['_UPDATEKVOP']._serialized_end=423
-  _globals['_TOKEN_LISTS']._serialized_start=425
-  _globals['_TOKEN_LISTS']._serialized_end=454
-  _globals['_KVBLOCKPOS']._serialized_start=456
-  _globals['_KVBLOCKPOS']._serialized_end=514
-  _globals['_SEARCHRESULT']._serialized_start=516
-  _globals['_SEARCHRESULT']._serialized_end=570
-  _globals['_UPLOADKVMETAREQUEST']._serialized_start=572
-  _globals['_UPLOADKVMETAREQUEST']._serialized_end=628
-  _globals['_UPLOADKVMETARESPONSE']._serialized_start=630
-  _globals['_UPLOADKVMETARESPONSE']._serialized_end=669
-  _globals['_REGISTERINSTANCEREQUEST']._serialized_start=671
-  _globals['_REGISTERINSTANCEREQUEST']._serialized_end=738
-  _globals['_REGISTERINSTANCERESPONSE']._serialized_start=740
-  _globals['_REGISTERINSTANCERESPONSE']._serialized_end=783
-  _globals['_REMOVEKVMETAREQUEST']._serialized_start=785
-  _globals['_REMOVEKVMETAREQUEST']._serialized_end=860
-  _globals['_REMOVEKVMETARESPONSE']._serialized_start=862
-  _globals['_REMOVEKVMETARESPONSE']._serialized_end=901
-  _globals['_KVMETA2DATA']._serialized_start=904
-  _globals['_KVMETA2DATA']._serialized_end=1160
+  _globals['_TRANSFERKVREQUEST']._serialized_start=26
+  _globals['_TRANSFERKVREQUEST']._serialized_end=150
+  _globals['_TRANSFERKVRESPONSE']._serialized_start=152
+  _globals['_TRANSFERKVRESPONSE']._serialized_end=188
+  _globals['_REGISTERINSTANCEREQUEST']._serialized_start=191
+  _globals['_REGISTERINSTANCEREQUEST']._serialized_end=334
+  _globals['_REGISTERINSTANCERESPONSE']._serialized_start=336
+  _globals['_REGISTERINSTANCERESPONSE']._serialized_end=379
+  _globals['_LMCACHEGRPC']._serialized_start=382
+  _globals['_LMCACHEGRPC']._serialized_end=555
 # @@protoc_insertion_point(module_scope)

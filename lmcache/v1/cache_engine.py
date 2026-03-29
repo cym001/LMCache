@@ -552,11 +552,6 @@ class LMCacheEngine:
                     self.kv_events.append(stored_event)
                     prev_key = key.chunk_hash
 
-        # Upload KV metadata to metadata server regardless of whether memory_objs is empty
-        if self.global_kvclient is not None:
-            self.global_kvclient.upload_kv_meta(tokens)
-        else:
-            logger.info("GlobalKVClient is not enabled, skipping upload KV metadata")
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
