@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package lmcache;
+
+service LmcacheServer {
+    rpc TransferKv(TransferKvRequest) returns (TransferKvResponse);
+}
+
+// 1.迁移KV Cache
+message TransferKvRequest {
+    bytes hash = 1;
+    string position = 2; 
+    repeated uint32 offset = 3;
+    string target_ip = 4;
+    int32 target_port = 5;
+    bool do_copy = 6;
+}
+
+message TransferKvResponse {
+    int32 status = 1;
+}

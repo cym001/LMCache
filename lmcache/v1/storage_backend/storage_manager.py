@@ -228,6 +228,7 @@ class StorageManager:
         event_manager: EventManager,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         async_lookup_server: Optional["LMCacheAsyncLookupServer"] = None,
+        global_kvclient: Optional[Any] = None,
     ):
         self.config = config
         self.metadata = metadata
@@ -243,6 +244,8 @@ class StorageManager:
         self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
         self.manager_lock = threading.Lock()
         self.lmcache_worker = lmcache_worker
+        
+        self.global_kvclient = global_kvclient
 
         # Use the unified create path so that init and
         # dynamic creation share the same logic.
@@ -1287,6 +1290,7 @@ class StorageManager:
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
+                global_kvclient=self.global_kvclient,
             )
 
             created: Dict[str, str] = {}
@@ -1351,6 +1355,7 @@ class StorageManager:
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
+                global_kvclient=global_kvclient,
             )
 
             created: Dict[str, str] = {}

@@ -67,6 +67,9 @@ from lmcache.v1.token_database import (
     TokenDatabase,
 )
 
+from lmcache.v1.remote.globalkv_client import KvCacheClient
+from lmcache.v1.remote.server.globalkv_server import GlobalKvServer
+
 logger = init_logger(__name__)
 
 # Type aliases for processed chunks
@@ -168,7 +171,39 @@ class LMCacheEngine:
         self.async_loading = config.enable_async_loading
         self.event_manager = EventManager()
 
+        # 初始化global_kvclient (在StorageManager之前,以便传递给LocalCPUBackend)
+        self.global_kvclient = KvCacheClient(config, "127.0.0.1", 17070)
+
+        self.storage_manager = StorageManager(
+            config,
+            metadata,
+            # self.memory_allocator,
+            event_manager=self.event_manager,
+            lmcache_worker=self.lmcache_worker,
+            global_kvclient=self.global_kvclient,
+        )
+
         self.use_layerwise = config.use_layerwise
+
+        # Initialize GlobalKvServer if enabled
+        self.globalkv_server: Optional[GlobalKvServer] = None
+        if config.enable_globalkv_server:
+            # kv_transfer_rpc_ports is a list, get the first port or use default
+            rpc_port = config.globalkv_server_port
+            if config.kv_transfer_rpc_ports:
+                rpc_port = config.kv_transfer_rpc_ports[0]
+            
+            self.globalkv_server = GlobalKvServer(
+                cache_engine=self,
+                host=config.globalkv_server_host,
+                port=rpc_port,
+                max_workers=config.globalkv_server_max_workers,
+            )
+            self.globalkv_server.start()
+            logger.info(
+                f"GlobalKvServer started on {config.globalkv_server_host}:"
+                f"{rpc_port}"
+            )
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -574,6 +609,8 @@ class LMCacheEngine:
         )
         tot_time = store_stats.time_to_store()
 
+        self.global_kvclient.upload_kv_meta(tokens)
+
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
             "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
@@ -587,6 +624,180 @@ class LMCacheEngine:
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
         )
+
+    @_lmcache_nvtx_annotate
+    def kv_transfer(
+        self,
+        hashes: List[int],
+        offsets: List[int],
+        old_position: str,
+        peer_ip: str,
+        peer_init_port: int,
+        event_id: str,
+        do_copy: bool = True,
+    ) -> int:
+        """
+        Transfer KV cache from current node to an arbitrary target peer node.
+        
+        This method enables flexible KV cache migration to any peer node by
+        specifying the target peer's IP and ports, without relying on
+        pre-configured peer lists.
+        
+        Args:
+            hashes: List of chunk hashes to identify the KV cache chunks
+            offsets: List of token counts for each chunk
+                    (must match length of hashes)
+            old_position: Source storage backend location
+                         (e.g., "LocalCPUBackend")
+            peer_ip: IP address of the target peer
+                    (e.g., "192.168.1.100")
+            peer_init_port: Initialization port of the target peer
+                           (e.g., 5555)
+            event_id: Unique identifier for this transfer operation
+            do_copy: If True, copy data (keep source).
+                    If False, move data (remove source).
+            
+        Returns:
+            Number of tokens successfully transferred
+            -1 if KV cache does not exist
+            -2 if transfer failed for other reasons
+            
+        """
+        # Step 1: Lookup the keys in the source location
+        num_tokens = self.lookup(
+            hashes=hashes,
+            offsets=offsets,
+            search_range=old_position,
+            lookup_id=event_id,
+            pin=True,
+        )
+
+        if not num_tokens:
+            logger.info(
+                "KV transfer is not performed as there are no tokens to "
+                "transfer. KV cache does not exist."
+            )
+            return -1
+
+        keys = self.lookup_pins[event_id]
+
+        # Step 2: Get memory objects from the source location
+        memory_objs = self.storage_manager.batched_get(
+            keys=keys,
+            location=old_position,
+        )
+        if memory_objs is None:
+            logger.error("Failed to get memory objects to transfer")
+            return -2
+        logger.info(
+            f"Trying to transfer {len(memory_objs)} memory objects to "
+            f"peer {peer_ip}:{peer_init_port}"
+        )
+
+        # Step 3: Prepare transfer specification with actual chunk offsets
+        # Extract actual token counts from memory objects
+        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
+        actual_offsets = [
+            m.meta.shape[token_dim] for m in memory_objs  # type: ignore
+        ]
+
+        # Step 4: Get KvTransferBackend and perform the transfer
+        logger.info(self.storage_manager.storage_backends)
+        kv_transfer_backend = self.storage_manager.storage_backends.get(
+            "KvTransferBackend"
+        )
+        
+        if kv_transfer_backend is None:
+            logger.error(
+                "KvTransferBackend is not available in storage backends"
+            )
+            return -2
+
+        # Step 5: Execute the transfer asynchronously
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                kv_transfer_backend.transfer_to_peer(
+                    peer_ip=peer_ip,
+                    peer_init_port=peer_init_port,
+                    keys=keys,
+                    objs=memory_objs,  # type: ignore
+                    offsets=actual_offsets,
+                    event_id=event_id,
+                ),
+                self.storage_manager.loop,
+            )
+
+            num_transferred = future.result()
+            
+            if num_transferred != len(keys):
+                logger.warning(
+                    f"Only {num_transferred}/{len(keys)} chunks were "
+                    f"transferred successfully"
+                )
+                if num_transferred == 0:
+                    return -2
+        except Exception as e:
+            logger.error(f"KV transfer failed with exception: {e}")
+            return -2
+
+        # Step 6: Optionally remove from source (if move instead of copy)
+        if not do_copy:
+            self.storage_manager.batched_remove(keys, locations=[old_position])
+            logger.info(
+                f"Removed {len(keys)} chunks from source location {old_position} "
+                f"after transfer"
+            )
+
+        logger.info(
+            f"KV transfer completed: {num_tokens} tokens transferred from "
+            f"{old_position} to peer {peer_ip}:{peer_init_port}"
+        )
+        return num_tokens
+
+    def _upload_hit_kv_metadata(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        ret_mask: torch.Tensor,
+    ) -> None:
+        """
+        Upload metadata of hit KV blocks to the metadata server.
+        
+        :param tokens: The tokens corresponding to KV caches.
+        :param ret_mask: Boolean mask indicating which tokens were retrieved (hit).
+        """
+        try:
+            # Convert tokens to list if it's a tensor
+            if isinstance(tokens, torch.Tensor):
+                tokens_list = tokens.tolist()
+            else:
+                tokens_list = list(tokens)
+            
+            # Extract hit tokens using the mask
+            hit_indices = torch.nonzero(ret_mask, as_tuple=True)[0].tolist()
+            
+            if not hit_indices:
+                logger.debug("No tokens were hit, skipping metadata upload")
+                return
+            
+            # Extract the hit tokens
+            hit_tokens = [tokens_list[idx] for idx in hit_indices]
+            
+            # Upload to metadata server
+            if self.global_kvclient is not None:
+                success = self.global_kvclient.upload_kv_meta(hit_tokens)
+                if success:
+                    logger.debug(
+                        f"Successfully uploaded metadata for {len(hit_tokens)} hit tokens"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to upload metadata for {len(hit_tokens)} hit tokens"
+                    )
+            else:
+                logger.debug("global_kvclient is not initialized, skipping metadata upload")
+                
+        except Exception as e:
+            logger.error(f"Error uploading hit KV metadata: {e}", exc_info=True)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1629,6 +1840,12 @@ class LMCacheEngine:
                 logger.info("lmcache_worker closed successfully")
             except Exception as e:
                 logger.error("Error closing lmcache_worker: %s", e)
+
+        # Stop GlobalKvServer if it's running
+        if self.globalkv_server is not None and self.globalkv_server.is_running():
+            logger.info("Stopping GlobalKvServer...")
+            self.globalkv_server.stop()
+            logger.info("GlobalKvServer stopped.")
 
         try:
             logger.info("Closing storage_manager...")
