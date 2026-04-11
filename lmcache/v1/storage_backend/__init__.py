@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from typing import TYPE_CHECKING, AbstractSet, Optional
+from typing import TYPE_CHECKING, AbstractSet, Any, Optional
 import asyncio
 import importlib  # Added for dynamic import
 
@@ -236,10 +236,13 @@ def CreateStorageBackends(
         storage_backends[backend_name] = remote_backend
 
     if (
-        config.enable_kv_transfer
-        and config.kv_transfer_host is not None
-        and config.kv_transfer_init_ports is not None
+        getattr(config, "enable_kv_transfer", False)
+        and getattr(config, "kv_transfer_host", None) is not None
+        and getattr(config, "kv_transfer_init_port", None) is not None
     ):
+        # First Party
+        from lmcache.v1.storage_backend.kv_transfer_backend import KvTransferBackend
+
         assert local_cpu_backend is not None
         kv_transfer_backend = KvTransferBackend(
             config=config,

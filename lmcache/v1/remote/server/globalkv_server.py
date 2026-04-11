@@ -8,7 +8,7 @@ of the LMCacheEngine, allowing remote nodes to request KV cache transfers.
 
 import grpc
 from concurrent import futures
-from typing import Optional, List
+from typing import Optional, List, Union
 import uuid
 
 # Import generated protobuf modules
@@ -35,6 +35,7 @@ except ImportError:
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
+HashValue = Union[int, bytes]
 
 
 class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
@@ -85,6 +86,9 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             # The number of hashes should match the number of offsets
             hash_bytes = request.hash
             hashes = self._parse_hashes(hash_bytes, len(offsets))
+            # Log hashes in hex for easier cross-node debugging.
+            # hashes_hex = [h.hex() for h in hashes]
+            # logger.info(f"TransferKv: hashes(hex)={hashes_hex}")
             
             # Get the source position (storage backend location)
             old_position = request.position if request.position else "LocalCPUBackend"
@@ -145,6 +149,20 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                 event_id=event_id,
                 do_copy=do_copy,
             )
+            if num_tokens == -1:
+                fallback_hashes = self._convert_hashes_to_int(hashes)
+                logger.info(
+                    "TransferKv retry with int hashes for type compatibility."
+                )
+                num_tokens = self.cache_engine.kv_transfer(
+                    hashes=fallback_hashes,
+                    offsets=offsets,
+                    old_position=old_position,
+                    peer_ip=target_ip,
+                    peer_init_port=target_port,
+                    event_id=event_id,
+                    do_copy=do_copy,
+                )
             
             logger.info(
                 f"TransferKv completed: result={num_tokens} tokens"
@@ -162,9 +180,9 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             context.set_details(str(e))
             return kvserver_pb2.TransferKvResponse(status=-2)
     
-    def _parse_hashes(self, hash_bytes: bytes, num_hashes: int) -> List[int]:
+    def _parse_hashes(self, hash_bytes: bytes, num_hashes: int) -> List[bytes]:
         """
-        Parse the hash bytes into a list of integer hashes based on offset count.
+        Parse the hash bytes into a list of 32-byte hashes based on offset count.
         
         The hash bytes are expected to be a sequence of 32-byte (256-bit)
         hash values concatenated together. The number of hashes to parse
@@ -175,7 +193,7 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             num_hashes: Number of hashes to parse (should match len(offsets))
             
         Returns:
-            List of integer hash values
+            List of 32-byte hash values (bytes)
         """
         if not hash_bytes or num_hashes <= 0:
             return []
@@ -192,22 +210,20 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                 f"Will parse as many complete hashes as possible."
             )
         
-        hashes = []
+        hashes: List[bytes] = []
         for i in range(num_hashes):
             start = i * hash_size
             end = start + hash_size
             
             if end <= len(hash_bytes):
-                # Extract 32 bytes and convert to integer (big-endian)
+                # Extract a complete 32-byte hash.
                 chunk = hash_bytes[start:end]
-                hash_value = int.from_bytes(chunk, byteorder='big')
-                hashes.append(hash_value)
+                hashes.append(chunk)
             elif start < len(hash_bytes):
-                # Handle partial chunk at the end (pad with zeros)
+                # Handle partial chunk at the end (left pad to keep big-endian semantics)
                 chunk = hash_bytes[start:]
-                padded = chunk.ljust(hash_size, b'\x00')
-                hash_value = int.from_bytes(padded, byteorder='big')
-                hashes.append(hash_value)
+                padded = chunk.rjust(hash_size, b"\x00")
+                hashes.append(padded)
                 logger.warning(
                     f"Hash {i} has only {len(chunk)} bytes, padded to {hash_size} bytes"
                 )
@@ -219,6 +235,10 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                 break
         
         return hashes
+
+    def _convert_hashes_to_int(self, hashes: List[bytes]) -> List[int]:
+        """Convert 32-byte hashes to big-endian integers for fallback path."""
+        return [int.from_bytes(h, byteorder="big", signed=False) for h in hashes]
 
 
 class GlobalKvServer:

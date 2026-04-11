@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
+import keyword
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
 import time
@@ -49,6 +50,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         dst_device: str = "cuda",
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
+        global_kvclient: Optional[Any] = None,
     ):
         if torch.cuda.is_available():
             super().__init__(dst_device)
@@ -80,6 +82,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
+        self.global_kvclient = global_kvclient
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -379,9 +382,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 allocator_align_bytes,
             )
 
-        if config.enable_p2p:
-            # TODO(baoloongmao): Add lazy memory allocator support for P2P mode
-            # For now, keep the original P2P implementation
+        use_paged_allocator = config.enable_p2p or getattr(
+            config, "enable_kv_transfer", False
+        )
+        if use_paged_allocator:
+            # P2P and KvTransfer backends both require page-aligned CPU buffers
+            # with stable pointer metadata for transfer channels.
             assert metadata is not None
             shapes = metadata.get_shapes()
             dtypes = metadata.get_dtypes()
