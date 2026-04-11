@@ -445,6 +445,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                 else:
                     yield start_idx, end_idx, hash_val
                 start_idx = end_idx
+            # logger.info(f"hashes_len: {len(hashes)}, offsets: {offsets}")
         else:
             raise ValueError("Either tokens or hashes must be provided.")
 

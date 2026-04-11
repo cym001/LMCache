@@ -66,6 +66,9 @@ _CONFIG_ALIASES = {
     "nixl_role": "pd_role",
     "controller_url": "controller_pull_url",
     "lmcache_worker_port": "lmcache_worker_ports",
+    "kv_transfer_http_ports": "kv_transfer_http_port",
+    "kv_transfer_init_ports": "kv_transfer_init_port",
+    "kv_transfer_rpc_ports": "kv_transfer_rpc_port",
     "plugin_locations": "runtime_plugin_locations",
     "external_backends": "storage_plugins",
 }
@@ -78,6 +81,15 @@ _DEPRECATED_CONFIGS = {
     ),
     "external_backends": (
         "external_backends is deprecated, use storage_plugins instead"
+    ),
+    "kv_transfer_http_ports": (
+        "kv_transfer_http_ports is deprecated, use kv_transfer_http_port instead"
+    ),
+    "kv_transfer_init_ports": (
+        "kv_transfer_init_ports is deprecated, use kv_transfer_init_port instead"
+    ),
+    "kv_transfer_rpc_ports": (
+        "kv_transfer_rpc_ports is deprecated, use kv_transfer_rpc_port instead"
     ),
 }
 
@@ -329,6 +341,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
     },
     # Storage paths
+    "weka_path": {"type": Optional[str], "default": None, "env_converter": str},
     "gds_path": {"type": Optional[str], "default": None, "env_converter": str},
     "gds_path_sharding": {
         "type": str,
@@ -485,6 +498,73 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "type": Optional[list[str]],
         "default": None,
         "env_converter": _to_str_list,
+    },
+    # KV Transfer Backend configurations
+    "enable_kv_transfer": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "kv_transfer_host": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "kv_transfer_http_port": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
+    "kv_transfer_init_port": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
+    "kv_transfer_rpc_port": {
+        "type": Optional[int],
+        "default": None,
+        "env_converter": int,
+    },
+    "kv_transfer_model_name": {
+        "type": Optional[str],
+        "default": None,
+        "env_converter": str,
+    },
+    "kv_transfer_max_connections": {
+        "type": int,
+        "default": 100,
+        "env_converter": int,
+    },
+    "kv_transfer_idle_timeout_seconds": {
+        "type": float,
+        "default": 300.0,
+        "env_converter": float,
+    },
+    "kv_transfer_cleanup_interval_seconds": {
+        "type": float,
+        "default": 60.0,
+        "env_converter": float,
+    },
+    # GlobalKvServer configurations
+    "enable_globalkv_server": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "globalkv_server_host": {
+        "type": str,
+        "default": "0.0.0.0",
+        "env_converter": str,
+    },
+    "globalkv_server_port": {
+        "type": int,
+        "default": 50052,
+        "env_converter": int,
+    },
+    "globalkv_server_max_workers": {
+        "type": int,
+        "default": 10,
+        "env_converter": int,
     },
     # Lazy memory allocator configurations
     "enable_lazy_memory_allocator": {

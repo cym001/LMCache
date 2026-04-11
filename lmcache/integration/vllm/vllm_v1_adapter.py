@@ -45,6 +45,7 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
+from lmcache.v1.remote.globalkv_client import KvCacheClient
 
 if TYPE_CHECKING:
     # Third Party
@@ -477,7 +478,24 @@ class LMCacheConnectorV1Impl:
         self._apply_extra_config(config, vllm_config)
         self.config = config
 
-        service_factory = VllmServiceFactory(config, vllm_config, role.name.lower())
+        meta_host = config.get_extra_config_value("globalkv_meta_host", "127.0.0.1")
+        meta_port = int(config.get_extra_config_value("globalkv_meta_port", 17070))
+        # GlobalKV NewRequest is sent from get_num_new_matched_tokens (scheduler);
+        # RequestEnd from request_finished (scheduler). Both are scheduler-side
+        # methods, so KvCacheClient must be available for the scheduler role.
+        global_kvclient: Optional[KvCacheClient] = None
+        try:
+            global_kvclient = KvCacheClient(config, meta_host, meta_port)
+        except Exception as e:
+            logger.warning("Failed to create GlobalKV client: %s", e)
+
+        service_factory = VllmServiceFactory(
+            config,
+            vllm_config,
+            role.name.lower(),
+            global_kvclient=global_kvclient,
+        )
+        self._global_kvclient = global_kvclient
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
         # Start services managed by LMCacheManager
@@ -594,6 +612,8 @@ class LMCacheConnectorV1Impl:
             )
         )
         self._invalid_block_ids: set[int] = set()
+        # Non-scheduler: dedupe GlobalKV NewRequest in get_num_new_matched_tokens.
+        self._global_kv_new_request_reported: set[str] = set()
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -768,6 +788,7 @@ class LMCacheConnectorV1Impl:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
         """
+        
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -1338,6 +1359,9 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        # INSERT_YOUR_CODE
+        # if finished_req_ids:
+        #     logger.info("Starting get finished, req_ids: %s", list(finished_req_ids))
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -1376,6 +1400,44 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+
+        # Report new inference requests to GlobalKV metadata service.
+        # This runs for any role that has a GlobalKV client; the cache-lookup
+        # path below is scheduler-only, so workers return early afterwards.
+        # if self._global_kvclient is not None:
+        #     req_id = request.request_id
+        #     if req_id not in self._global_kv_new_request_reported:
+        #         token_ids_for_gkv: list[int]
+        #         atok = request.all_token_ids
+        #         if hasattr(atok, "tolist"):
+        #             token_ids_for_gkv = atok.tolist()
+        #         else:
+        #             token_ids_for_gkv = list(atok)
+        #         mm_hashes, mm_positions = extract_mm_features(request)
+        #         if mm_hashes and mm_positions:
+        #             t = torch.tensor(request.prompt_token_ids)
+        #             apply_mm_hashes_to_token_ids(t, mm_hashes, mm_positions)
+        #             token_ids_for_gkv = t.tolist()
+        #         if self.skip_last_n_tokens > 0:
+        #             token_ids_for_gkv = token_ids_for_gkv[
+        #                 : -self.skip_last_n_tokens
+        #             ]
+        #         try:
+        #             self._global_kvclient.new_request(
+        #                 req_id, token_ids_for_gkv
+        #             )
+        #             self._global_kv_new_request_reported.add(req_id)
+        #         except Exception as e:
+        #             logger.warning(
+        #                 "GlobalKV NewRequest failed for %s: %s",
+        #                 req_id,
+        #                 e,
+        #             )
+
+        # # Workers don't perform cache lookup; only the scheduler does.
+        # if self._role != KVConnectorRole.SCHEDULER:
+        #     return 0
+
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1932,6 +1994,19 @@ class LMCacheConnectorV1Impl:
                 return_params["num_lmcache_cached_tokens"] = (
                     request_tracker.num_lmcache_cached_tokens
                 )
+
+        # if self._global_kvclient is not None:
+        #     try:
+        #         self._global_kvclient.request_end(
+        #             request.request_id, list(request.all_token_ids)
+        #         )
+        #     except Exception as e:
+        #         logger.warning(
+        #             "GlobalKV RequestEnd failed for %s: %s",
+        #             request.request_id,
+        #             e,
+        #         )
+        #     self._global_kv_new_request_reported.discard(request.request_id)
 
         return False, return_params
 

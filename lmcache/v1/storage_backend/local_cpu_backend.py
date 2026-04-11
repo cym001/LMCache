@@ -2,6 +2,7 @@
 # Standard
 from concurrent.futures import Future
 from contextlib import nullcontext
+import keyword
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
 import time
@@ -53,6 +54,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         dst_device: str = torch_device_type,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
+        global_kvclient: Optional[Any] = None,
     ):
         if torch_dev.is_available():
             super().__init__(dst_device)
@@ -84,6 +86,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
+        self.global_kvclient = global_kvclient
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -390,12 +393,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 allocator_align_bytes,
             )
 
-        if config.enable_p2p:
+        use_paged_allocator = config.enable_p2p or getattr(
+            config, "enable_kv_transfer", False
+        )
+        if use_paged_allocator:
             if use_hugepages:
-                raise ValueError("Hugepages are not supported with P2P mode")
+                raise ValueError(
+                    "Hugepages are not supported with P2P or KV transfer mode"
+                )
 
             # TODO(baoloongmao): Add lazy memory allocator support for P2P mode
-            # For now, keep the original P2P implementation
+            # P2P and KvTransfer require page-aligned CPU buffers with stable
+            # pointer metadata for their transfer channels.
             assert metadata is not None
             shapes = metadata.get_shapes()
             dtypes = metadata.get_dtypes()

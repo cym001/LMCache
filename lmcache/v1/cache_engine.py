@@ -17,10 +17,12 @@ from typing import (
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.health_monitor.base import HealthMonitor
+    from lmcache.v1.remote.globalkv_client import KvCacheClient
 
 # Standard
 import asyncio
 import gc
+import json
 import multiprocessing
 import time
 
@@ -67,7 +69,6 @@ from lmcache.v1.token_database import (
     TokenDatabase,
 )
 
-from lmcache.v1.remote.globalkv_client import KvCacheClient
 from lmcache.v1.remote.server.globalkv_server import GlobalKvServer
 
 logger = init_logger(__name__)
@@ -108,6 +109,7 @@ class LMCacheEngine:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        global_kvclient: Optional["KvCacheClient"] = None,
     ):
         logger.info("Creating LMCacheEngine with config: %s", config)
         self.config = config
@@ -170,38 +172,25 @@ class LMCacheEngine:
 
         self.async_loading = config.enable_async_loading
         self.event_manager = EventManager()
-
-        # 初始化global_kvclient (在StorageManager之前,以便传递给LocalCPUBackend)
-        self.global_kvclient = KvCacheClient(config, "127.0.0.1", 17070)
-
-        self.storage_manager = StorageManager(
-            config,
-            metadata,
-            # self.memory_allocator,
-            event_manager=self.event_manager,
-            lmcache_worker=self.lmcache_worker,
-            global_kvclient=self.global_kvclient,
-        )
+        self.global_kvclient = global_kvclient
 
         self.use_layerwise = config.use_layerwise
 
         # Initialize GlobalKvServer if enabled
         self.globalkv_server: Optional[GlobalKvServer] = None
-        if config.enable_globalkv_server:
+        if getattr(config, "enable_globalkv_server", False):
             # kv_transfer_rpc_ports is a list, get the first port or use default
-            rpc_port = config.globalkv_server_port
-            if config.kv_transfer_rpc_ports:
-                rpc_port = config.kv_transfer_rpc_ports[0]
-            
+            rpc_port = getattr(config, "kv_transfer_rpc_port", 17071)
+
             self.globalkv_server = GlobalKvServer(
                 cache_engine=self,
-                host=config.globalkv_server_host,
+                host=getattr(config, "kv_transfer_host", "0.0.0.0"),
                 port=rpc_port,
-                max_workers=config.globalkv_server_max_workers,
+                max_workers=getattr(config, "globalkv_server_max_workers", 10),
             )
             self.globalkv_server.start()
             logger.info(
-                f"GlobalKvServer started on {config.globalkv_server_host}:"
+                f"GlobalKvServer started on {self.globalkv_server.host}:"
                 f"{rpc_port}"
             )
 
@@ -362,9 +351,21 @@ class LMCacheEngine:
                     event_manager=self.event_manager,
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
+                    global_kvclient=self.global_kvclient,
                 )
                 if self.hidden_state_store is not None:
                     self.hidden_state_store.bind_storage_manager(self.storage_manager)
+                # Inject the engine's kv_events list into KvTransferBackend so
+                # that transfer events are appended directly here rather than
+                # kept in a separate per-backend queue.
+                if self.kv_events_enabled:
+                    kv_transfer_backend = (
+                        self.storage_manager.storage_backends.get(
+                            "KvTransferBackend"
+                        )
+                    )
+                    if kv_transfer_backend is not None:
+                        kv_transfer_backend.set_kv_events_sink(self.kv_events)
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -462,6 +463,19 @@ class LMCacheEngine:
 
         assert self.storage_manager is not None
 
+        # # 以256个token为粒度划分tokens并以logger.info输出
+        # if tokens is not None:
+        #     # tokens is either a 1D tensor or a list of ints
+        #     if isinstance(tokens, torch.Tensor):
+        #         tokens_list = tokens.tolist()
+        #     else:
+        #         tokens_list = list(tokens)
+
+        #     chunk_size = 256
+        #     num_tokens = len(tokens_list)
+        #     for i in range(0, num_tokens, chunk_size):
+        #         chunk = tokens_list[i : i + chunk_size]
+        #         logger.info(f"Token chunk [{i}:{i+len(chunk)}]: {chunk}")
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
 
@@ -609,7 +623,8 @@ class LMCacheEngine:
         )
         tot_time = store_stats.time_to_store()
 
-        self.global_kvclient.upload_kv_meta(tokens)
+        # if self.global_kvclient is not None:
+        #     self.global_kvclient.upload_kv_meta(tokens)
 
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
@@ -624,6 +639,26 @@ class LMCacheEngine:
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
         )
+        # block_hashes_hex = []
+        # for key in keys:
+        #     chunk_hash = key.chunk_hash
+        #     if isinstance(chunk_hash, int):
+        #         # sha256-cbor hash is expected to be 32 bytes.
+        #         hash_bytes = (chunk_hash & ((1 << 256) - 1)).to_bytes(
+        #             32, byteorder="big", signed=False
+        #         )
+        #     else:
+        #         hash_bytes = bytes(chunk_hash)
+        #         if len(hash_bytes) < 32:
+        #             hash_bytes = hash_bytes.rjust(32, b"\x00")
+        #         elif len(hash_bytes) > 32:
+        #             hash_bytes = hash_bytes[-32:]
+        #     block_hashes_hex.append(hash_bytes.hex())
+        # logger.info(
+        #     "[req_id=%s] Block hashes (hex): %s",
+        #     req_id,
+        #     json.dumps(block_hashes_hex),
+        # )
 
     @_lmcache_nvtx_annotate
     def kv_transfer(
@@ -663,11 +698,13 @@ class LMCacheEngine:
             -2 if transfer failed for other reasons
             
         """
-        # Step 1: Lookup the keys in the source location
+        # Step 1: Lookup the keys in the source location.
+        # lookup() implements longest-prefix matching: if a hash is missing,
+        # it stops at that point and only pins the matched prefix keys.
         num_tokens = self.lookup(
             hashes=hashes,
             offsets=offsets,
-            search_range=old_position,
+            search_range=[old_position],
             lookup_id=event_id,
             pin=True,
         )
@@ -679,80 +716,98 @@ class LMCacheEngine:
             )
             return -1
 
-        keys = self.lookup_pins[event_id]
-
-        # Step 2: Get memory objects from the source location
-        memory_objs = self.storage_manager.batched_get(
-            keys=keys,
-            location=old_position,
-        )
-        if memory_objs is None:
-            logger.error("Failed to get memory objects to transfer")
-            return -2
-        logger.info(
-            f"Trying to transfer {len(memory_objs)} memory objects to "
-            f"peer {peer_ip}:{peer_init_port}"
-        )
-
-        # Step 3: Prepare transfer specification with actual chunk offsets
-        # Extract actual token counts from memory objects
-        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
-        actual_offsets = [
-            m.meta.shape[token_dim] for m in memory_objs  # type: ignore
-        ]
-
-        # Step 4: Get KvTransferBackend and perform the transfer
-        logger.info(self.storage_manager.storage_backends)
-        kv_transfer_backend = self.storage_manager.storage_backends.get(
-            "KvTransferBackend"
-        )
-        
-        if kv_transfer_backend is None:
-            logger.error(
-                "KvTransferBackend is not available in storage backends"
-            )
-            return -2
-
-        # Step 5: Execute the transfer asynchronously
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                kv_transfer_backend.transfer_to_peer(
-                    peer_ip=peer_ip,
-                    peer_init_port=peer_init_port,
-                    keys=keys,
-                    objs=memory_objs,  # type: ignore
-                    offsets=actual_offsets,
-                    event_id=event_id,
-                ),
-                self.storage_manager.loop,
-            )
-
-            num_transferred = future.result()
-            
-            if num_transferred != len(keys):
-                logger.warning(
-                    f"Only {num_transferred}/{len(keys)} chunks were "
-                    f"transferred successfully"
+            block_mapping = self.lookup_pins[event_id]
+            # Extract only the keys that were actually found (longest prefix match).
+            # When hashes are missing in the middle, lookup stops at the first miss,
+            # so block_mapping[old_position] contains only the matched prefix chunks.
+            keys = block_mapping.get(old_position, [])
+            if not keys:
+                logger.info(
+                    "KV transfer is not performed as no matching keys were found "
+                    f"in {old_position}."
                 )
-                if num_transferred == 0:
-                    return -2
-        except Exception as e:
-            logger.error(f"KV transfer failed with exception: {e}")
-            return -2
+                return -1
 
-        # Step 6: Optionally remove from source (if move instead of copy)
-        if not do_copy:
-            self.storage_manager.batched_remove(keys, locations=[old_position])
+            # Step 2: Get memory objects from the source location
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=old_position,
+            )
+            if memory_objs is None:
+                logger.error("Failed to get memory objects to transfer")
+                return -2
             logger.info(
-                f"Removed {len(keys)} chunks from source location {old_position} "
-                f"after transfer"
+                f"Trying to transfer {len(memory_objs)} memory objects to "
+                f"peer {peer_ip}:{peer_init_port}"
             )
 
-        logger.info(
-            f"KV transfer completed: {num_tokens} tokens transferred from "
-            f"{old_position} to peer {peer_ip}:{peer_init_port}"
-        )
-        return num_tokens
+            # Step 3: Prepare transfer specification with actual chunk offsets
+            # Extract actual token counts from memory objects
+            token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
+            actual_offsets = [
+                m.meta.shape[token_dim] for m in memory_objs  # type: ignore
+            ]
+            hashes = [key.chunk_hash for key in keys]
+
+            # Step 4: Get KvTransferBackend and perform the transfer
+            kv_transfer_backend = self.storage_manager.storage_backends.get(
+                "KvTransferBackend"
+            )
+
+            if kv_transfer_backend is None:
+                logger.error(
+                    "KvTransferBackend is not available in storage backends"
+                )
+                return -2
+
+            # Step 5: Execute the transfer asynchronously
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    kv_transfer_backend.transfer_to_peer(
+                        peer_ip=peer_ip,
+                        peer_init_port=peer_init_port,
+                        hashes=hashes,
+                        objs=memory_objs,  # type: ignore
+                        offsets=actual_offsets,
+                        event_id=event_id,
+                    ),
+                    self.storage_manager.loop,
+                )
+
+                num_transferred = future.result()
+
+                if num_transferred != len(keys):
+                    logger.warning(
+                        f"Only {num_transferred}/{len(keys)} chunks were "
+                        f"transferred successfully"
+                    )
+                    if num_transferred == 0:
+                        return -2
+            except Exception as e:
+                logger.error(f"KV transfer failed with exception: {e}")
+                return -2
+
+            # Step 6: Optionally remove from source (if move instead of copy)
+            # Unpin before batched_remove so backends can still resolve keys
+            # (e.g. LocalCPUBackend.unpin).
+            if not do_copy:
+                self.lookup_unpin(event_id)
+                self.storage_manager.batched_remove(
+                    keys, locations=[old_position]
+                )
+                logger.info(
+                    f"Removed {len(keys)} chunks from source location "
+                    f"{old_position} after transfer"
+                )
+
+            logger.info(
+                f"KV transfer completed: {num_tokens} tokens transferred from "
+                f"{old_position} to peer {peer_ip}:{peer_init_port}"
+            )
+            return num_tokens
+        finally:
+            self.lookup_unpin(event_id)
 
     def _upload_hit_kv_metadata(
         self,
@@ -1484,49 +1539,58 @@ class LMCacheEngine:
             logger.debug("Move is not performed as there are no tokens to move.")
             return 0
 
-        block_mapping = self.lookup_pins[event_id]
-        assert len(block_mapping) == 1
-        keys = block_mapping[old_position]
+        try:
+            block_mapping = self.lookup_pins[event_id]
+            assert len(block_mapping) == 1
+            keys = block_mapping[old_position]
 
-        memory_objs = self.storage_manager.batched_get(
-            keys=keys,
-            location=old_position,
-        )
-        assert None not in memory_objs, "Failed to get memory objects to move"
-        logger.debug(
-            f"Trying to send {len(memory_objs)} memory objects to {new_position}"
-        )
+            memory_objs = self.storage_manager.batched_get(
+                keys=keys,
+                location=old_position,
+            )
+            assert None not in memory_objs, "Failed to get memory objects to move"
+            logger.debug(
+                f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+            )
 
-        # TODO: reduce loops
-        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
-        offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
+            # TODO: reduce loops
+            token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
+            offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
 
-        transfer_spec = {
-            "target_peer_init_url": new_position[0],
-            "offsets": offsets,
-        }
+            transfer_spec = {
+                "target_peer_init_url": new_position[0],
+                "offsets": offsets,
+            }
 
-        logger.info(self.storage_manager.storage_backends)
-        p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
+            logger.info(self.storage_manager.storage_backends)
+            p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
 
-        future = asyncio.run_coroutine_threadsafe(
-            p2p_backend.async_batched_submit_put_task(
-                keys,
-                memory_objs,  # type: ignore
-                transfer_spec=transfer_spec,
-            ),
-            self.storage_manager.loop,
-        )
+            future = asyncio.run_coroutine_threadsafe(
+                p2p_backend.async_batched_submit_put_task(
+                    keys,
+                    memory_objs,  # type: ignore
+                    transfer_spec=transfer_spec,
+                ),
+                self.storage_manager.loop,
+            )
 
-        future.result()
+            future.result()
 
-        if not do_copy:
-            self.storage_manager.batched_remove(keys, locations=[old_position])
+            if not do_copy:
+                self.lookup_unpin(event_id)
+                self.storage_manager.batched_remove(
+                    keys, locations=[old_position]
+                )
 
-        logger.debug(
-            "Moving %d token from %s to %s", num_tokens, old_position, new_position
-        )
-        return num_tokens
+            logger.debug(
+                "Moving %d token from %s to %s",
+                num_tokens,
+                old_position,
+                new_position,
+            )
+            return num_tokens
+        finally:
+            self.lookup_unpin(event_id)
 
     # TODO(Jiayi): Add layerwise support.
     @_lmcache_nvtx_annotate
@@ -1854,6 +1918,12 @@ class LMCacheEngine:
             logger.info("storage_manager closed successfully")
         except Exception as e:
             logger.error("Error closing storage_manager: %s", e)
+
+        if self.global_kvclient is not None:
+            try:
+                self.global_kvclient.close()
+            except Exception as e:
+                logger.error(f"Error closing global_kvclient: {e}")
 
         logger.info("LMCacheEngine closed.")
 
@@ -2315,6 +2385,7 @@ class LMCacheEngineBuilder:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
+        global_kvclient: Optional["KvCacheClient"] = None,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -2341,6 +2412,7 @@ class LMCacheEngineBuilder:
                 gpu_connector,
                 broadcast_fn,
                 broadcast_object_fn,
+                global_kvclient=global_kvclient,
             )
 
             cls._instances[instance_id] = engine
