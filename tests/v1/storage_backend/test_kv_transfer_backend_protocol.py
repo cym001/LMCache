@@ -83,6 +83,19 @@ def test_build_local_keys_uses_local_worker_id() -> None:
     assert [key.worker_id for key in keys] == [worker_id, worker_id]
 
 
+def test_build_local_keys_accepts_bytes_hashes() -> None:
+    backend, worker_id = _make_backend_stub(worker_id=9)
+    hashes = [b"\x01" * 32, b"\x02" * 32]
+
+    keys = backend._build_local_keys_from_hashes_offsets(
+        hashes=hashes,
+        offsets=[16, 16],
+    )
+
+    assert [key.chunk_hash for key in keys] == hashes
+    assert [key.worker_id for key in keys] == [worker_id, worker_id]
+
+
 @pytest.mark.anyio
 async def test_handle_put_rebuilds_local_keys_before_store() -> None:
     backend, worker_id = _make_backend_stub(worker_id=3)

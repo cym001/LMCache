@@ -103,15 +103,15 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             # Generate a unique event ID for this transfer
             event_id = str(uuid.uuid4())
             
-            logger.info(
-                f"TransferKv request received: "
-                f"hashes_count={len(hashes)}, "
-                f"offsets={offsets}, "
-                f"position={old_position}, "
-                f"target={target_ip}:{target_port}, "
-                f"do_copy={do_copy}, "
-                f"event_id={event_id}"
-            )
+            # logger.info(
+            #     f"TransferKv request received: "
+            #     f"hashes_count={len(hashes)}, "
+            #     f"offsets={offsets}, "
+            #     f"position={old_position}, "
+            #     f"target={target_ip}:{target_port}, "
+            #     f"do_copy={do_copy}, "
+            #     f"event_id={event_id}"
+            # )
             
             # Validate inputs
             if not hashes:
@@ -164,9 +164,9 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                     do_copy=do_copy,
                 )
             
-            logger.info(
-                f"TransferKv completed: result={num_tokens} tokens"
-            )
+            # logger.info(
+            #     f"TransferKv completed: result={num_tokens} tokens"
+            # )
             
             # Return status directly from kv_transfer
             # -1: KV cache does not exist
