@@ -2,6 +2,11 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import Future
+from dataclasses import dataclass
+from functools import wraps
+import queue
+import threading
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -73,6 +78,31 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+@dataclass
+class _KvTransferJob:
+    hashes: List[int]
+    offsets: List[int]
+    old_position: str
+    peer_ip: str
+    peer_init_port: int
+    event_id: str
+    do_copy: bool
+    token_ids: Optional[List[int]]
+    result: Future[int]
+
+
+def _foreground_operation(method: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(method)
+    def wrapper(self: "LMCacheEngine", *args: Any, **kwargs: Any) -> Any:
+        self._enter_foreground_operation()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._exit_foreground_operation()
+
+    return wrapper
 
 
 class CacheEngineEndSignal:
@@ -228,6 +258,22 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
+
+        self._foreground_condition = threading.Condition()
+        self._foreground_ops = 0
+        self._migration_worker_shutdown = False
+        queue_size = int(
+            self.config.get_extra_config_value("kv_transfer_queue_size", 1024)
+        )
+        self._migration_queue: queue.Queue[Optional[_KvTransferJob]] = queue.Queue(
+            maxsize=queue_size
+        )
+        self._migration_worker = threading.Thread(
+            target=self._migration_worker_loop,
+            name=f"LMCacheKvTransferWorker-{metadata.worker_id}",
+            daemon=True,
+        )
+        self._migration_worker.start()
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -394,8 +440,74 @@ class LMCacheEngine:
             return self.storage_manager.is_hot_cache_enabled()
         return False
 
+    def _enter_foreground_operation(self) -> None:
+        with self._foreground_condition:
+            self._foreground_ops += 1
+
+    def _exit_foreground_operation(self) -> None:
+        with self._foreground_condition:
+            self._foreground_ops -= 1
+            if self._foreground_ops < 0:
+                logger.warning("Foreground operation count became negative; resetting")
+                self._foreground_ops = 0
+            if self._foreground_ops == 0:
+                self._foreground_condition.notify_all()
+
+    def _wait_for_foreground_idle(self) -> bool:
+        with self._foreground_condition:
+            while self._foreground_ops > 0 and not self._migration_worker_shutdown:
+                self._foreground_condition.wait(timeout=0.1)
+            return not self._migration_worker_shutdown
+
+    def _migration_worker_loop(self) -> None:
+        while True:
+            job = self._migration_queue.get()
+            try:
+                if job is None:
+                    return
+                if not self._wait_for_foreground_idle():
+                    job.result.set_result(-2)
+                    continue
+                result = self._execute_kv_transfer_job(job)
+                job.result.set_result(result)
+            except Exception as e:
+                logger.error("KV transfer worker failed: %s", e, exc_info=True)
+                if job is not None:
+                    job.result.set_result(-2)
+            finally:
+                self._migration_queue.task_done()
+
+    def _submit_kv_transfer_job(self, job: _KvTransferJob) -> int:
+        self._migration_queue.put(job)
+        return job.result.result()
+
+    def _stop_migration_worker(self) -> None:
+        self._migration_worker_shutdown = True
+        with self._foreground_condition:
+            self._foreground_condition.notify_all()
+
+        worker = getattr(self, "_migration_worker", None)
+        migration_queue = getattr(self, "_migration_queue", None)
+        if worker is None or migration_queue is None or not worker.is_alive():
+            return
+
+        while True:
+            try:
+                migration_queue.put_nowait(None)
+                break
+            except queue.Full:
+                try:
+                    pending_job = migration_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                if pending_job is not None:
+                    pending_job.result.set_result(-2)
+                migration_queue.task_done()
+        worker.join(timeout=1.0)
+
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
+    @_foreground_operation
     def store(
         self,
         tokens: Optional[Union[torch.Tensor, list[int]]] = None,
@@ -676,14 +788,35 @@ class LMCacheEngine:
             -2 if transfer failed for other reasons
             
         """
+        if self._migration_worker_shutdown:
+            logger.warning("KV transfer rejected because migration worker is stopped")
+            return -2
+
+        job = _KvTransferJob(
+            hashes=hashes,
+            offsets=offsets,
+            old_position=old_position,
+            peer_ip=peer_ip,
+            peer_init_port=peer_init_port,
+            event_id=event_id,
+            do_copy=do_copy,
+            token_ids=token_ids,
+            result=Future(),
+        )
+        return self._submit_kv_transfer_job(job)
+
+    def _execute_kv_transfer_job(self, job: _KvTransferJob) -> int:
+        assert self.storage_manager is not None
+        memory_objs: Optional[List[Optional[MemoryObj]]] = None
+
         # Step 1: Lookup the keys in the source location.
         # lookup() implements longest-prefix matching: if a hash is missing,
         # it stops at that point and only pins the matched prefix keys.
         num_tokens = self.lookup(
-            hashes=hashes,
-            offsets=offsets,
-            search_range=[old_position],
-            lookup_id=event_id,
+            hashes=job.hashes,
+            offsets=job.offsets,
+            search_range=[job.old_position],
+            lookup_id=job.event_id,
             pin=True,
         )
 
@@ -695,38 +828,39 @@ class LMCacheEngine:
             return -1
 
         try:
-            block_mapping = self.lookup_pins[event_id]
+            block_mapping = self.lookup_pins[job.event_id]
             # Extract only the keys that were actually found (longest prefix match).
             # When hashes are missing in the middle, lookup stops at the first miss,
             # so block_mapping[old_position] contains only the matched prefix chunks.
-            keys = block_mapping.get(old_position, [])
+            keys = block_mapping.get(job.old_position, [])
             if not keys:
                 logger.info(
                     "KV transfer is not performed as no matching keys were found "
-                    f"in {old_position}."
+                    f"in {job.old_position}."
                 )
                 return -1
 
             # Step 2: Get memory objects from the source location
             memory_objs = self.storage_manager.batched_get(
                 keys=keys,
-                location=old_position,
+                location=job.old_position,
             )
-            if memory_objs is None:
+            if memory_objs is None or any(obj is None for obj in memory_objs):
                 logger.error("Failed to get memory objects to transfer")
                 return -2
+            transfer_objs = [obj for obj in memory_objs if obj is not None]
             logger.info(
-                f"Trying to transfer {len(memory_objs)} memory objects to "
-                f"peer {peer_ip}:{peer_init_port}"
+                f"Trying to transfer {len(transfer_objs)} memory objects to "
+                f"peer {job.peer_ip}:{job.peer_init_port}"
             )
 
             # Step 3: Prepare transfer specification with actual chunk offsets
             # Extract actual token counts from memory objects
-            token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
+            token_dim = transfer_objs[0].meta.fmt.token_dim()
             actual_offsets = [
-                m.meta.shape[token_dim] for m in memory_objs  # type: ignore
+                memory_obj.meta.shape[token_dim] for memory_obj in transfer_objs
             ]
-            hashes = [key.chunk_hash for key in keys]
+            transfer_hashes = [key.chunk_hash for key in keys]
 
             # Step 4: Get KvTransferBackend and perform the transfer
             kv_transfer_backend = self.storage_manager.storage_backends.get(
@@ -743,13 +877,13 @@ class LMCacheEngine:
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     kv_transfer_backend.transfer_to_peer(
-                        peer_ip=peer_ip,
-                        peer_init_port=peer_init_port,
-                        hashes=hashes,
-                        objs=memory_objs,  # type: ignore
+                        peer_ip=job.peer_ip,
+                        peer_init_port=job.peer_init_port,
+                        hashes=transfer_hashes,
+                        objs=transfer_objs,
                         offsets=actual_offsets,
-                        event_id=event_id,
-                        token_ids=token_ids,
+                        event_id=job.event_id,
+                        token_ids=job.token_ids,
                     ),
                     self.storage_manager.loop,
                 )
@@ -770,23 +904,27 @@ class LMCacheEngine:
             # Step 6: Optionally remove from source (if move instead of copy)
             # Unpin before batched_remove so backends can still resolve keys
             # (e.g. LocalCPUBackend.unpin).
-            if not do_copy:
-                self.lookup_unpin(event_id)
+            if not job.do_copy:
+                self.lookup_unpin(job.event_id)
                 self.storage_manager.batched_remove(
-                    keys, locations=[old_position]
+                    keys, locations=[job.old_position]
                 )
                 logger.info(
                     f"Removed {len(keys)} chunks from source location "
-                    f"{old_position} after transfer"
+                    f"{job.old_position} after transfer"
                 )
 
             logger.info(
                 f"KV transfer completed: {num_tokens} tokens transferred from "
-                f"{old_position} to peer {peer_ip}:{peer_init_port}"
+                f"{job.old_position} to peer {job.peer_ip}:{job.peer_init_port}"
             )
             return num_tokens
         finally:
-            self.lookup_unpin(event_id)
+            self.lookup_unpin(job.event_id)
+            if memory_objs is not None:
+                for memory_obj in memory_objs:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
 
     def _upload_hit_kv_metadata(
         self,
@@ -1021,6 +1159,7 @@ class LMCacheEngine:
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
+    @_foreground_operation
     def retrieve(
         self,
         tokens: Union[torch.Tensor, list[int]],
@@ -1463,6 +1602,7 @@ class LMCacheEngine:
             logger.debug("Move is not performed as there are no tokens to move.")
             return 0
 
+        memory_objs: Optional[List[Optional[MemoryObj]]] = None
         try:
             block_mapping = self.lookup_pins[event_id]
             assert len(block_mapping) == 1
@@ -1472,14 +1612,17 @@ class LMCacheEngine:
                 keys=keys,
                 location=old_position,
             )
-            assert None not in memory_objs, "Failed to get memory objects to move"
+            assert memory_objs is not None and None not in memory_objs, (
+                "Failed to get memory objects to move"
+            )
+            move_objs = [obj for obj in memory_objs if obj is not None]
             logger.debug(
-                f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+                f"Trying to send {len(move_objs)} memory objects to {new_position}"
             )
 
             # TODO: reduce loops
-            token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
-            offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
+            token_dim = move_objs[0].meta.fmt.token_dim()
+            offsets = [memory_obj.meta.shape[token_dim] for memory_obj in move_objs]
 
             transfer_spec = {
                 "target_peer_init_url": new_position[0],
@@ -1492,7 +1635,7 @@ class LMCacheEngine:
             future = asyncio.run_coroutine_threadsafe(
                 p2p_backend.async_batched_submit_put_task(
                     keys,
-                    memory_objs,  # type: ignore
+                    move_objs,
                     transfer_spec=transfer_spec,
                 ),
                 self.storage_manager.loop,
@@ -1512,6 +1655,10 @@ class LMCacheEngine:
             return num_tokens
         finally:
             self.lookup_unpin(event_id)
+            if memory_objs is not None:
+                for memory_obj in memory_objs:
+                    if memory_obj is not None:
+                        memory_obj.ref_count_down()
 
     # TODO(Jiayi): Add layerwise support.
     @_lmcache_nvtx_annotate
@@ -1791,6 +1938,8 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+
+        self._stop_migration_worker()
 
         if self.lmcache_worker is not None:
             try:
