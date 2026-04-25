@@ -105,6 +105,9 @@ class BatchedLookupAndPutMsg(KvTransferMsgBase):
     # Indexes (remote) of allocated memory objects (to be read)
     mem_indexes: list[int]
 
+    # Optional flat token ids for the full transfer request
+    token_ids: list[int] | None = None
+
 
 class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
     """Batched PUT response message"""
@@ -475,6 +478,7 @@ class KvTransferBackend(StorageBackendInterface):
             r_mem_indexes = msg.mem_indexes
             hashes = msg.hashes
             offsets = msg.offsets
+            token_ids = msg.token_ids
             keys = self._build_local_keys_from_hashes_offsets(hashes, offsets)
             logger.info(
                 "PUT request rebuilt %d keys from %d hashes",
@@ -530,26 +534,29 @@ class KvTransferBackend(StorageBackendInterface):
                 memory_objs=local_mem_objs,
             )
 
-            # Publish CacheStoreEvent for each successfully received chunk
+            # Publish one aggregated CacheStoreEvent for this transfer request.
+            # Include all requested blocks (already existing + newly transferred)
+            # so observability can reconstruct full transfer scope.
             if self.kv_events is not None:
-                prev_key = None
-                for idx, key in enumerate(keys_to_read):
-                    num_tokens = offsets_to_read[idx]
-                    stored_event = CacheStoreEvent(
-                        block_hashes=[key.chunk_hash],
-                        parent_block_hash=prev_key,
-                        token_ids=[],
-                        block_size=num_tokens,
-                        lora_id=None,
-                        medium="cpu",
-                        lora_name=None,
-                    )
-                    logger.debug(
-                        "Added kv cache event '%s' to kv cache events queue"
-                        % stored_event
-                    )
-                    self.kv_events.append(stored_event)
-                    prev_key = key.chunk_hash
+                event_token_ids = self._validate_transfer_event_token_ids(
+                    token_ids=token_ids,
+                    offsets=offsets,
+                    event_id=event_id,
+                )
+                stored_event = CacheStoreEvent(
+                    block_hashes=[key.chunk_hash for key in keys],
+                    parent_block_hash=None,
+                    token_ids=event_token_ids,
+                    block_size=sum(offsets),
+                    lora_id=None,
+                    medium="cpu",
+                    lora_name=None,
+                )
+                logger.debug(
+                    "Added kv transfer aggregate event '%s' to kv cache events queue",
+                    stored_event,
+                )
+                self.kv_events.append(stored_event)
 
             return BatchedLookupAndPutRetMsg(
                 event_id=event_id,
@@ -578,6 +585,29 @@ class KvTransferBackend(StorageBackendInterface):
             len(hashes),
         )
         return keys
+
+    def _validate_transfer_event_token_ids(
+        self,
+        token_ids: Optional[list[int]],
+        offsets: list[int],
+        event_id: str,
+    ) -> list[int]:
+        """Validate flat token ids for transfer event reporting."""
+        if token_ids is None:
+            return []
+
+        expected = sum(offsets)
+        if len(token_ids) != expected:
+            logger.warning(
+                "Transfer event token_ids length mismatch for event_id=%s: "
+                "got=%d expected=%d. Falling back to empty token_ids.",
+                event_id,
+                len(token_ids),
+                expected,
+            )
+            return []
+
+        return list(token_ids)
 
     async def _ensure_peer_connection(
         self,
@@ -1044,6 +1074,7 @@ class KvTransferBackend(StorageBackendInterface):
         objs: List[MemoryObj],
         offsets: Optional[List[int]] = None,
         event_id: str = "",
+        token_ids: Optional[List[int]] = None,
     ) -> int:
         """
         Transfer KV cache data to a specific peer node.
@@ -1058,6 +1089,7 @@ class KvTransferBackend(StorageBackendInterface):
             objs: List of memory objects containing the KV cache data
             offsets: Optional token counts. If None, uses chunk_size.
             event_id: Optional event ID for request correlation (auto-generated if empty)
+            token_ids: Optional flat token ids for the full transfer request.
         
         Returns:
             Number of chunks successfully transferred to the peer
@@ -1071,6 +1103,7 @@ class KvTransferBackend(StorageBackendInterface):
             "peer_init_url": peer_init_url,
             "offsets": offsets,
             "event_id": event_id,
+            "token_ids": token_ids,
         }
         
         return await self.async_batched_submit_put_task(
@@ -1095,6 +1128,7 @@ class KvTransferBackend(StorageBackendInterface):
                 - peer_init_url: The ZMQ URL of the target peer
                 - offsets: Token counts for each chunk
                 - event_id: Optional event ID for request correlation
+                - token_ids: Optional flat token ids for event reporting
                 
         Returns:
             Number of chunks successfully transferred to the peer
@@ -1107,6 +1141,7 @@ class KvTransferBackend(StorageBackendInterface):
         peer_init_url = transfer_spec["peer_init_url"]
         offsets = transfer_spec["offsets"]
         event_id = transfer_spec.get("event_id", "")
+        token_ids = transfer_spec.get("token_ids")
 
         # Establish connection to target peer (reuses existing connection if available)
         await self._ensure_peer_connection(peer_init_url)
@@ -1123,6 +1158,7 @@ class KvTransferBackend(StorageBackendInterface):
             sender_id=self.local_init_url,
             hashes=list(hashes),
             offsets=offsets,
+            token_ids=token_ids,
             mem_indexes=local_indexes,
         )
 

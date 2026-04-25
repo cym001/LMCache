@@ -99,6 +99,9 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             
             # Get copy/move flag
             do_copy = request.do_copy
+
+            # Optional flat token ids for transfer event reporting
+            token_ids = list(request.tokens)
             
             # Generate a unique event ID for this transfer
             event_id = str(uuid.uuid4())
@@ -148,6 +151,7 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                 peer_init_port=target_port,
                 event_id=event_id,
                 do_copy=do_copy,
+                token_ids=token_ids,
             )
             if num_tokens == -1:
                 fallback_hashes = self._convert_hashes_to_int(hashes)
@@ -162,6 +166,7 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                     peer_init_port=target_port,
                     event_id=event_id,
                     do_copy=do_copy,
+                    token_ids=token_ids,
                 )
             
             # logger.info(

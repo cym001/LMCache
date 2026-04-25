@@ -16,7 +16,7 @@ kv_transfer_host: "127.0.0.1"
 kv_transfer_http_port: 8011
 kv_transfer_init_port: 8207
 kv_transfer_rpc_port: 8208
-kv_transfer_model_name: "Meta-Llama-3.1-8B-Instruct"
+kv_transfer_model_name: "Qwen3-8B"
 transfer_channel: "nixl"
 
 # Controller configurations
