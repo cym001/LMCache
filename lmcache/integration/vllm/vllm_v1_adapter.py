@@ -1253,39 +1253,39 @@ class LMCacheConnectorV1Impl:
         # Report new inference requests to GlobalKV metadata service.
         # This runs for any role that has a GlobalKV client; the cache-lookup
         # path below is scheduler-only, so workers return early afterwards.
-        # if self._global_kvclient is not None:
-        #     req_id = request.request_id
-        #     if req_id not in self._global_kv_new_request_reported:
-        #         token_ids_for_gkv: list[int]
-        #         atok = request.all_token_ids
-        #         if hasattr(atok, "tolist"):
-        #             token_ids_for_gkv = atok.tolist()
-        #         else:
-        #             token_ids_for_gkv = list(atok)
-        #         mm_hashes, mm_positions = extract_mm_features(request)
-        #         if mm_hashes and mm_positions:
-        #             t = torch.tensor(request.prompt_token_ids)
-        #             apply_mm_hashes_to_token_ids(t, mm_hashes, mm_positions)
-        #             token_ids_for_gkv = t.tolist()
-        #         if self.skip_last_n_tokens > 0:
-        #             token_ids_for_gkv = token_ids_for_gkv[
-        #                 : -self.skip_last_n_tokens
-        #             ]
-        #         try:
-        #             self._global_kvclient.new_request(
-        #                 req_id, token_ids_for_gkv
-        #             )
-        #             self._global_kv_new_request_reported.add(req_id)
-        #         except Exception as e:
-        #             logger.warning(
-        #                 "GlobalKV NewRequest failed for %s: %s",
-        #                 req_id,
-        #                 e,
-        #             )
+        if self._global_kvclient is not None:
+            req_id = request.request_id
+            if req_id not in self._global_kv_new_request_reported:
+                token_ids_for_gkv: list[int]
+                atok = request.all_token_ids
+                if hasattr(atok, "tolist"):
+                    token_ids_for_gkv = atok.tolist()
+                else:
+                    token_ids_for_gkv = list(atok)
+                mm_hashes, mm_positions = extract_mm_features(request)
+                if mm_hashes and mm_positions:
+                    t = torch.tensor(request.prompt_token_ids)
+                    apply_mm_hashes_to_token_ids(t, mm_hashes, mm_positions)
+                    token_ids_for_gkv = t.tolist()
+                if self.skip_last_n_tokens > 0:
+                    token_ids_for_gkv = token_ids_for_gkv[
+                        : -self.skip_last_n_tokens
+                    ]
+                try:
+                    self._global_kvclient.new_request(
+                        req_id, token_ids_for_gkv
+                    )
+                    self._global_kv_new_request_reported.add(req_id)
+                except Exception as e:
+                    logger.warning(
+                        "GlobalKV NewRequest failed for %s: %s",
+                        req_id,
+                        e,
+                    )
 
-        # # Workers don't perform cache lookup; only the scheduler does.
-        # if self._role != KVConnectorRole.SCHEDULER:
-        #     return 0
+        # Workers don't perform cache lookup; only the scheduler does.
+        if self._role != KVConnectorRole.SCHEDULER:
+            return 0
 
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
@@ -1744,18 +1744,18 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        # if self._global_kvclient is not None:
-        #     try:
-        #         self._global_kvclient.request_end(
-        #             request.request_id, list(request.all_token_ids)
-        #         )
-        #     except Exception as e:
-        #         logger.warning(
-        #             "GlobalKV RequestEnd failed for %s: %s",
-        #             request.request_id,
-        #             e,
-        #         )
-        #     self._global_kv_new_request_reported.discard(request.request_id)
+        if self._global_kvclient is not None:
+            try:
+                self._global_kvclient.request_end(
+                    request.request_id, list(request.all_token_ids)
+                )
+            except Exception as e:
+                logger.warning(
+                    "GlobalKV RequestEnd failed for %s: %s",
+                    request.request_id,
+                    e,
+                )
+            self._global_kv_new_request_reported.discard(request.request_id)
 
         return False, return_params
 

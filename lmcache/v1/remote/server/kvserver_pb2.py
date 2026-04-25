@@ -24,17 +24,17 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ekvserver.proto\x12\x07lmcache\"|\n\x11TransferKvRequest\x12\x0c\n\x04hash\x18\x01 \x01(\x0c\x12\x10\n\x08position\x18\x02 \x01(\t\x12\x0e\n\x06offset\x18\x03 \x03(\r\x12\x11\n\ttarget_ip\x18\x04 \x01(\t\x12\x13\n\x0btarget_port\x18\x05 \x01(\x05\x12\x0f\n\x07\x64o_copy\x18\x06 \x01(\x08\"$\n\x12TransferKvResponse\x12\x0e\n\x06status\x18\x01 \x01(\x05\x32V\n\rLmcacheServer\x12\x45\n\nTransferKv\x12\x1a.lmcache.TransferKvRequest\x1a\x1b.lmcache.TransferKvResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0ekvserver.proto\x12\x07lmcache\"\x8c\x01\n\x11TransferKvRequest\x12\x0c\n\x04hash\x18\x01 \x01(\x0c\x12\x10\n\x08position\x18\x02 \x01(\t\x12\x0e\n\x06offset\x18\x03 \x03(\r\x12\x11\n\ttarget_ip\x18\x04 \x01(\t\x12\x13\n\x0btarget_port\x18\x05 \x01(\x05\x12\x0f\n\x07\x64o_copy\x18\x06 \x01(\x08\x12\x0e\n\x06tokens\x18\x07 \x03(\r\"$\n\x12TransferKvResponse\x12\x0e\n\x06status\x18\x01 \x01(\x05\x32V\n\rLmcacheServer\x12\x45\n\nTransferKv\x12\x1a.lmcache.TransferKvRequest\x1a\x1b.lmcache.TransferKvResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'kvserver_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_TRANSFERKVREQUEST']._serialized_start=27
-  _globals['_TRANSFERKVREQUEST']._serialized_end=151
-  _globals['_TRANSFERKVRESPONSE']._serialized_start=153
-  _globals['_TRANSFERKVRESPONSE']._serialized_end=189
-  _globals['_LMCACHESERVER']._serialized_start=191
-  _globals['_LMCACHESERVER']._serialized_end=277
+  _globals['_TRANSFERKVREQUEST']._serialized_start=28
+  _globals['_TRANSFERKVREQUEST']._serialized_end=168
+  _globals['_TRANSFERKVRESPONSE']._serialized_start=170
+  _globals['_TRANSFERKVRESPONSE']._serialized_end=206
+  _globals['_LMCACHESERVER']._serialized_start=208
+  _globals['_LMCACHESERVER']._serialized_end=294
 # @@protoc_insertion_point(module_scope)

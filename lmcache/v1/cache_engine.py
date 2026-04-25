@@ -598,8 +598,8 @@ class LMCacheEngine:
         )
         tot_time = store_stats.time_to_store()
 
-        # if self.global_kvclient is not None:
-        #     self.global_kvclient.upload_kv_meta(tokens)
+        if self.global_kvclient is not None:
+            self.global_kvclient.upload_kv_meta(tokens)
 
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
@@ -645,6 +645,7 @@ class LMCacheEngine:
         peer_init_port: int,
         event_id: str,
         do_copy: bool = True,
+        token_ids: Optional[List[int]] = None,
     ) -> int:
         """
         Transfer KV cache from current node to an arbitrary target peer node.
@@ -666,6 +667,8 @@ class LMCacheEngine:
             event_id: Unique identifier for this transfer operation
             do_copy: If True, copy data (keep source).
                     If False, move data (remove source).
+            token_ids: Optional flat token ids associated with this transfer.
+                       Used for kv event reporting on receiver.
             
         Returns:
             Number of tokens successfully transferred
@@ -746,6 +749,7 @@ class LMCacheEngine:
                         objs=memory_objs,  # type: ignore
                         offsets=actual_offsets,
                         event_id=event_id,
+                        token_ids=token_ids,
                     ),
                     self.storage_manager.loop,
                 )
