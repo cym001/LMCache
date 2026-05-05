@@ -379,7 +379,7 @@ class KvTransferBackend(StorageBackendInterface):
                 remote_xfer_handlers
             )
             
-            logger.info(f"Phase 2: memory registration completed for peer {peer_init_url}")
+            logger.debug(f"Phase 2: memory registration completed for peer {peer_init_url}")
             return NixlMemRegResponse(remote_xfer_dlist_bytes=local_xfer_descs)
 
         elif isinstance(req, KvTransferInitSideMsg):
@@ -501,67 +501,71 @@ class KvTransferBackend(StorageBackendInterface):
             keys_to_read = []
             offsets_to_read = []
             local_mem_objs = []
-            for idx, key in enumerate(keys):
-                if self.local_cpu_backend.contains(key, pin=False):
-                    logger.debug(f"Key {key} already exists locally, skipping")
-                    continue
-                
-                # Allocate memory for incoming data
-                r_mem_indexes_to_read.append(r_mem_indexes[idx])
-                shape = self.full_size_shape.copy()
-                shape[self.fmt.token_dim()] = offsets[idx]
-                local_mem_obj = self.local_cpu_backend.allocate(
-                    torch.Size(shape), self.dtype, self.fmt
+            try:
+                for idx, key in enumerate(keys):
+                    if self.local_cpu_backend.contains(key, pin=False):
+                        logger.debug(f"Key {key} already exists locally, skipping")
+                        continue
+
+                    # Allocate memory for incoming data
+                    r_mem_indexes_to_read.append(r_mem_indexes[idx])
+                    shape = self.full_size_shape.copy()
+                    shape[self.fmt.token_dim()] = offsets[idx]
+                    local_mem_obj = self.local_cpu_backend.allocate(
+                        torch.Size(shape), self.dtype, self.fmt
+                    )
+                    local_mem_objs.append(local_mem_obj)
+                    keys_to_read.append(key)
+                    offsets_to_read.append(offsets[idx])
+
+                # Receive data from the sending peer node
+                if keys_to_read:
+                    channel_transfer_spec = {
+                        "sender_id": sender_id,
+                        "remote_indexes": r_mem_indexes_to_read,
+                    }
+                    await self.transfer_channel.async_batched_read(
+                        buffers=local_mem_objs,
+                        transfer_spec=channel_transfer_spec,
+                    )
+
+                # Store received data in local backend
+                self.local_cpu_backend.batched_submit_put_task(
+                    keys=keys_to_read,
+                    memory_objs=local_mem_objs,
                 )
-                local_mem_objs.append(local_mem_obj)
-                keys_to_read.append(key)
-                offsets_to_read.append(offsets[idx])
 
-            # Receive data from the sending peer node
-            if keys_to_read:
-                channel_transfer_spec = {
-                    "sender_id": sender_id,
-                    "remote_indexes": r_mem_indexes_to_read,
-                }
-                await self.transfer_channel.async_batched_read(
-                    buffers=local_mem_objs,
-                    transfer_spec=channel_transfer_spec,
-                )
+                # Publish one aggregated CacheStoreEvent for this transfer request.
+                # Include all requested blocks (already existing + newly transferred)
+                # so observability can reconstruct full transfer scope.
+                if self.kv_events is not None:
+                    event_token_ids = self._validate_transfer_event_token_ids(
+                        token_ids=token_ids,
+                        offsets=offsets,
+                        event_id=event_id,
+                    )
+                    stored_event = CacheStoreEvent(
+                        block_hashes=[key.chunk_hash for key in keys],
+                        parent_block_hash=None,
+                        token_ids=event_token_ids,
+                        block_size=sum(offsets),
+                        lora_id=None,
+                        medium="cpu",
+                        lora_name=None,
+                    )
+                    logger.debug(
+                        "Added kv transfer aggregate event '%s' to kv cache events queue",
+                        stored_event,
+                    )
+                    self.kv_events.append(stored_event)
 
-            # Store received data in local backend
-            self.local_cpu_backend.batched_submit_put_task(
-                keys=keys_to_read,
-                memory_objs=local_mem_objs,
-            )
-
-            # Publish one aggregated CacheStoreEvent for this transfer request.
-            # Include all requested blocks (already existing + newly transferred)
-            # so observability can reconstruct full transfer scope.
-            if self.kv_events is not None:
-                event_token_ids = self._validate_transfer_event_token_ids(
-                    token_ids=token_ids,
-                    offsets=offsets,
+                return BatchedLookupAndPutRetMsg(
                     event_id=event_id,
+                    num_read_chunks=len(local_mem_objs),
                 )
-                stored_event = CacheStoreEvent(
-                    block_hashes=[key.chunk_hash for key in keys],
-                    parent_block_hash=None,
-                    token_ids=event_token_ids,
-                    block_size=sum(offsets),
-                    lora_id=None,
-                    medium="cpu",
-                    lora_name=None,
-                )
-                logger.debug(
-                    "Added kv transfer aggregate event '%s' to kv cache events queue",
-                    stored_event,
-                )
-                self.kv_events.append(stored_event)
-
-            return BatchedLookupAndPutRetMsg(
-                event_id=event_id,
-                num_read_chunks=len(local_mem_objs),
-            )
+            finally:
+                for mem_obj in local_mem_objs:
+                    mem_obj.ref_count_down()
 
         else:
             raise ValueError(f"Unsupported KvTransferMsg type: {type(msg)}")
@@ -679,7 +683,7 @@ class KvTransferBackend(StorageBackendInterface):
                     peer_init_url,
                 )
             
-            logger.info(
+            logger.debug(
                 "Establishing new nixl connection to peer node "
                 f"at ZMQ port {peer_init_url}"
             )
@@ -719,7 +723,7 @@ class KvTransferBackend(StorageBackendInterface):
             # Update statistics
             self.connection_pool_stats["total_connections_created"] += 1
             
-            logger.info(
+            logger.debug(
                 "Successfully established reusable connection to peer %s (pool size: %d/%d)",
                 peer_init_url,
                 len(self.connected_peers),
@@ -865,7 +869,7 @@ class KvTransferBackend(StorageBackendInterface):
         This task runs at regular intervals (cleanup_interval_seconds) and
         closes connections that have been idle for longer than idle_timeout_seconds.
         """
-        logger.info(
+        logger.debug(
             f"Starting connection cleanup task "
             f"(interval: {self.cleanup_interval_seconds}s, "
             f"idle_timeout: {self.idle_timeout_seconds}s)"
@@ -1177,8 +1181,8 @@ class KvTransferBackend(StorageBackendInterface):
             ret_msg = await self._send_request_and_wait(peer_init_url, event_id, msg)
             
             logger.info(
-                f"Successfully sent {ret_msg.num_read_chunks}/{len(hashes)} chunks "
-                f"to peer {peer_init_url} (event_id={event_id})"
+                f"Peer {peer_init_url} read {ret_msg.num_read_chunks} new chunks "
+                f"out of {len(hashes)} requested chunks (event_id={event_id})"
             )
             return ret_msg.num_read_chunks
         except Exception as e:
