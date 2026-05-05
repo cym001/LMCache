@@ -43,22 +43,22 @@ PYTHONHASHSEED=0 lmcache_controller --host 127.0.0.1 --port 9000 --monitor-ports
 
 Start vllm engine 1 at port 8010:
 ```bash
-VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/model --gpu-memory-utilization 0.9 --port 8010 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/Llama3.1-8b --gpu-memory-utilization 0.9 --port 8010 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
 ```
 Start vllm engine 2 at port 8011:
 ```bash
-VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=1 LMCACHE_CONFIG_FILE=example2.yaml vllm serve /root/autodl-tmp/model  --gpu-memory-utilization 0.9 --port 8011 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'  
+VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=1 LMCACHE_CONFIG_FILE=example2.yaml vllm serve /root/autodl-tmp/Llama3.1-8b  --gpu-memory-utilization 0.9 --port 8011 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'  
 ```
 
 
-VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/model --gpu-memory-utilization 0.9 --port 8010 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' --prefix-caching-hash-algo sha256_cbor
+VLLM_CONFIGURE_LOGGING=0 PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/Llama3.1-8b --gpu-memory-utilization 0.9 --port 8010 --max-model-len 131072 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' --prefix-caching-hash-algo sha256_cbor
 
 3. Send request to vllm engine 1:  
 ```bash
 curl -X POST http://localhost:8010/v1/completions \
   -H "Content-Type: application/json" \
   -d "{
-    \"model\": \"/root/autodl-tmp/model\",
+    \"model\": \"/root/autodl-tmp/Llama3.1-8b\",
     \"prompt\": \"$(printf 'you can Explain the significance of KV cache in large language models.%.0s' {1..100})\",
     \"max_tokens\": 10
   }"
@@ -69,7 +69,7 @@ curl -X POST http://localhost:8010/v1/completions \
 curl -X POST http://localhost:8011/v1/completions \
   -H "Content-Type: application/json" \
   -d "{
-    \"model\": \"/root/autodl-tmp/model\",
+    \"model\": \"/root/autodl-tmp/Llama3.1-8b\",
     \"prompt\": \"$(printf 'Explain the significance of KV cache in language models.%.0s' {1..100})\",
     \"max_tokens\": 10
   }"
@@ -123,8 +123,8 @@ PYTHONHASHSEED=0 UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1
 
 Start vllm engine 1 at port 8010:
 ```bash
-UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/model --gpu-memory-utilization 0.5 --port 8010 --max-model-len 8192 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
+UCX_TLS=tcp CUDA_VISIBLE_DEVICES=0 LMCACHE_CONFIG_FILE=example1.yaml vllm serve /root/autodl-tmp/Llama3.1-8b --gpu-memory-utilization 0.5 --port 8010 --max-model-len 8192 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'
 ```
 Start vllm engine 2 at port 8011:
 ```bash
-UCX_TLS=tcp CUDA_VISIBLE_DEVICES=1 LMCACHE_CONFIG_FILE=example2.yaml vllm serve /root/autodl-tmp/model  --gpu-memory-utilization 0.5 --port 8011 --max-model-len 8192 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'  
+UCX_TLS=tcp CUDA_VISIBLE_DEVICES=1 LMCACHE_CONFIG_FILE=example2.yaml vllm serve /root/autodl-tmp/Llama3.1-8b  --gpu-memory-utilization 0.5 --port 8011 --max-model-len 8192 --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}'  
