@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, TypeAlias, Union
 import asyncio
 import time
@@ -115,8 +116,32 @@ class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
     # Unique event ID for request-response correlation
     event_id: str
 
-    # Number of read chunks
+    # Number of chunks newly read from the sender
     num_read_chunks: int
+
+    # Number of requested chunks already present on the receiver
+    num_existing_chunks: int = 0
+
+
+@dataclass(frozen=True)
+class KvTransferPeerResult:
+    num_read_chunks: int
+    num_existing_chunks: int
+    num_requested_chunks: int
+    failed: bool = False
+
+    @property
+    def num_satisfied_chunks(self) -> int:
+        return self.num_read_chunks + self.num_existing_chunks
+
+    @property
+    def all_already_satisfied(self) -> bool:
+        return (
+            self.num_requested_chunks > 0
+            and self.num_existing_chunks == self.num_requested_chunks
+            and self.num_read_chunks == 0
+            and not self.failed
+        )
 
 
 KvTransferMsg = Union[
@@ -501,19 +526,32 @@ class KvTransferBackend(StorageBackendInterface):
             keys_to_read = []
             offsets_to_read = []
             local_mem_objs = []
+            existing_chunks_count = 0
             try:
                 for idx, key in enumerate(keys):
                     if self.local_cpu_backend.contains(key, pin=False):
+                        existing_chunks_count += 1
                         logger.debug(f"Key {key} already exists locally, skipping")
                         continue
 
                     # Allocate memory for incoming data
-                    r_mem_indexes_to_read.append(r_mem_indexes[idx])
                     shape = self.full_size_shape.copy()
                     shape[self.fmt.token_dim()] = offsets[idx]
                     local_mem_obj = self.local_cpu_backend.allocate(
-                        torch.Size(shape), self.dtype, self.fmt
+                        torch.Size(shape),
+                        self.dtype,
+                        self.fmt,
+                        busy_loop=False,
                     )
+                    if local_mem_obj is None:
+                        logger.warning(
+                            "KV transfer put allocation failed for key %s, "
+                            "skipping remaining chunks in this batch",
+                            key,
+                        )
+                        break
+
+                    r_mem_indexes_to_read.append(r_mem_indexes[idx])
                     local_mem_objs.append(local_mem_obj)
                     keys_to_read.append(key)
                     offsets_to_read.append(offsets[idx])
@@ -533,6 +571,16 @@ class KvTransferBackend(StorageBackendInterface):
                 self.local_cpu_backend.batched_submit_put_task(
                     keys=keys_to_read,
                     memory_objs=local_mem_objs,
+                )
+
+                logger.info(
+                    "KV transfer PUT satisfied %d/%d chunks "
+                    "(%d newly read, %d already existed; event_id=%s)",
+                    len(local_mem_objs) + existing_chunks_count,
+                    len(keys),
+                    len(local_mem_objs),
+                    existing_chunks_count,
+                    event_id,
                 )
 
                 # Publish one aggregated CacheStoreEvent for this transfer request.
@@ -562,6 +610,7 @@ class KvTransferBackend(StorageBackendInterface):
                 return BatchedLookupAndPutRetMsg(
                     event_id=event_id,
                     num_read_chunks=len(local_mem_objs),
+                    num_existing_chunks=existing_chunks_count,
                 )
             finally:
                 for mem_obj in local_mem_objs:
@@ -1000,8 +1049,21 @@ class KvTransferBackend(StorageBackendInterface):
             shape = self.full_size_shape.copy()
             shape[self.fmt.token_dim()] = chunk_tokens
             mem_obj = self.local_cpu_backend.allocate(
-                torch.Size(shape), self.dtype, self.fmt
+                torch.Size(shape),
+                self.dtype,
+                self.fmt,
+                busy_loop=False,
             )
+            if mem_obj is None:
+                logger.warning(
+                    "KV transfer get allocation failed after %d/%d chunks; "
+                    "returning empty result to avoid blocking",
+                    idx,
+                    len(keys),
+                )
+                for allocated_mem_obj in mem_objs:
+                    allocated_mem_obj.ref_count_down()
+                return []
             mem_objs.append(mem_obj)
             offsets.append(chunk_tokens)
             hashes.append(key.chunk_hash)
@@ -1079,7 +1141,7 @@ class KvTransferBackend(StorageBackendInterface):
         offsets: Optional[List[int]] = None,
         event_id: str = "",
         token_ids: Optional[List[int]] = None,
-    ) -> int:
+    ) -> KvTransferPeerResult:
         """
         Transfer KV cache data to a specific peer node.
         
@@ -1096,7 +1158,7 @@ class KvTransferBackend(StorageBackendInterface):
             token_ids: Optional flat token ids for the full transfer request.
         
         Returns:
-            Number of chunks successfully transferred to the peer
+            Transfer result with newly read, already existing, and requested counts
         """
         peer_init_url = f"{peer_ip}:{peer_init_port}"
         
@@ -1121,7 +1183,7 @@ class KvTransferBackend(StorageBackendInterface):
         hashes: Sequence[ChunkHash],
         objs: List[MemoryObj],
         transfer_spec: Any = None,
-    ) -> int:
+    ) -> KvTransferPeerResult:
         """
         Send KV cache data to an arbitrary peer node (PUT operation).
         
@@ -1135,7 +1197,7 @@ class KvTransferBackend(StorageBackendInterface):
                 - token_ids: Optional flat token ids for event reporting
                 
         Returns:
-            Number of chunks successfully transferred to the peer
+            Transfer result with newly read, already existing, and requested counts
         """
         # Code path for `move` operation in controller.
         assert isinstance(transfer_spec, dict)
@@ -1180,17 +1242,33 @@ class KvTransferBackend(StorageBackendInterface):
             # Lock-free concurrent request using event_id for correlation
             ret_msg = await self._send_request_and_wait(peer_init_url, event_id, msg)
             
-            logger.info(
-                f"Peer {peer_init_url} read {ret_msg.num_read_chunks} new chunks "
-                f"out of {len(hashes)} requested chunks (event_id={event_id})"
+            result = KvTransferPeerResult(
+                num_read_chunks=ret_msg.num_read_chunks,
+                num_existing_chunks=ret_msg.num_existing_chunks,
+                num_requested_chunks=len(hashes),
             )
-            return ret_msg.num_read_chunks
+            logger.info(
+                "Peer %s satisfied %d/%d chunks "
+                "(%d newly read, %d already existed; event_id=%s)",
+                peer_init_url,
+                result.num_satisfied_chunks,
+                result.num_requested_chunks,
+                result.num_read_chunks,
+                result.num_existing_chunks,
+                event_id,
+            )
+            return result
         except Exception as e:
             logger.error(
                 f"Failed to send data to peer {peer_init_url}: {e}. "
                 f"Transfer aborted."
             )
-            return 0
+            return KvTransferPeerResult(
+                num_read_chunks=0,
+                num_existing_chunks=0,
+                num_requested_chunks=len(hashes),
+                failed=True,
+            )
 
     async def direct_kv_transfer(
         self,

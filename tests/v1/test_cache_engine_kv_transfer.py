@@ -11,6 +11,11 @@ import pytest
 
 # First Party
 from lmcache.v1.cache_engine import LMCacheEngine, _KvTransferJob
+from lmcache.v1.kv_transfer_status import (
+    KV_TRANSFER_ALREADY_SATISFIED,
+    KV_TRANSFER_FAILED,
+)
+from lmcache.v1.storage_backend.kv_transfer_backend import KvTransferPeerResult
 
 
 def _make_transfer_job(result: Future[int] | None = None) -> _KvTransferJob:
@@ -56,8 +61,14 @@ def _make_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[LMCacheEngine, MagicM
     engine.lookup = MagicMock(return_value=16)
     engine.lookup_unpin = MagicMock()
 
-    transfer_future: Future[int] = Future()
-    transfer_future.set_result(1)
+    transfer_future: Future[KvTransferPeerResult] = Future()
+    transfer_future.set_result(
+        KvTransferPeerResult(
+            num_read_chunks=1,
+            num_existing_chunks=0,
+            num_requested_chunks=1,
+        )
+    )
     monkeypatch.setattr(
         "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
         MagicMock(return_value=transfer_future),
@@ -124,7 +135,7 @@ def test_kv_transfer_releases_memory_obj_on_missing_backend(
             event_id="evt",
         )
 
-        assert result == -2
+        assert result == KV_TRANSFER_FAILED
         memory_obj.ref_count_down.assert_called_once()
         engine.lookup_unpin.assert_called_once_with("evt")
     finally:
@@ -156,6 +167,72 @@ def test_kv_transfer_move_removes_before_releasing_get_ref(
         assert result == 16
         assert order.index("unpin") < order.index("remove")
         assert order.index("remove") < order.index("ref_down")
+    finally:
+        engine._stop_migration_worker()
+
+
+def test_kv_transfer_returns_already_satisfied_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, memory_obj = _make_engine(monkeypatch)
+    transfer_future: Future[KvTransferPeerResult] = Future()
+    transfer_future.set_result(
+        KvTransferPeerResult(
+            num_read_chunks=0,
+            num_existing_chunks=1,
+            num_requested_chunks=1,
+        )
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
+        MagicMock(return_value=transfer_future),
+    )
+
+    try:
+        result = engine.kv_transfer(
+            hashes=[101],
+            offsets=[16],
+            old_position="LocalCPUBackend",
+            peer_ip="127.0.0.1",
+            peer_init_port=5555,
+            event_id="evt",
+        )
+
+        assert result == KV_TRANSFER_ALREADY_SATISFIED
+        memory_obj.ref_count_down.assert_called_once()
+    finally:
+        engine._stop_migration_worker()
+
+
+def test_kv_transfer_returns_failed_when_peer_satisfies_no_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, memory_obj = _make_engine(monkeypatch)
+    transfer_future: Future[KvTransferPeerResult] = Future()
+    transfer_future.set_result(
+        KvTransferPeerResult(
+            num_read_chunks=0,
+            num_existing_chunks=0,
+            num_requested_chunks=1,
+        )
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
+        MagicMock(return_value=transfer_future),
+    )
+
+    try:
+        result = engine.kv_transfer(
+            hashes=[101],
+            offsets=[16],
+            old_position="LocalCPUBackend",
+            peer_ip="127.0.0.1",
+            peer_init_port=5555,
+            event_id="evt",
+        )
+
+        assert result == KV_TRANSFER_FAILED
+        memory_obj.ref_count_down.assert_called_once()
     finally:
         engine._stop_migration_worker()
 
