@@ -68,6 +68,10 @@ class LMCacheStats:
     interval_local_cpu_evict_count: int  # evict count
     interval_local_cpu_evict_keys_count: int  # evict keys count
     interval_local_cpu_evict_failed_count: int  # evict failed count
+    interval_background_local_cpu_evict_count: int  # background evict rounds
+    interval_background_local_cpu_evict_keys_count: int  # background evict keys
+    interval_alloc_fast_fail_count: int  # allocation fast-fail count
+    interval_allocate_wait_ms: float  # total alloc wait time in ms
 
     interval_forced_unpin_count: int  # forced unpin count due to timeout
 
@@ -292,6 +296,10 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+        self.interval_background_local_cpu_evict_count = 0
+        self.interval_background_local_cpu_evict_keys_count = 0
+        self.interval_alloc_fast_fail_count = 0
+        self.interval_allocate_wait_ms = 0.0
 
         self.interval_forced_unpin_count = 0
 
@@ -571,6 +579,19 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_failed_count += evict_failed_count
 
     @thread_safe
+    def update_background_local_cpu_evict(self, evicted_count: int):
+        self.interval_background_local_cpu_evict_count += 1
+        self.interval_background_local_cpu_evict_keys_count += evicted_count
+
+    @thread_safe
+    def update_alloc_fast_fail_count(self, delta: int = 1):
+        self.interval_alloc_fast_fail_count += delta
+
+    @thread_safe
+    def update_allocate_wait_ms(self, wait_ms: float):
+        self.interval_allocate_wait_ms += wait_ms
+
+    @thread_safe
     def update_forced_unpin_count(self, delta: int):
         self.interval_forced_unpin_count += delta
 
@@ -626,6 +647,10 @@ class LMCStatsMonitor:
         self.interval_local_cpu_evict_count = 0
         self.interval_local_cpu_evict_keys_count = 0
         self.interval_local_cpu_evict_failed_count = 0
+        self.interval_background_local_cpu_evict_count = 0
+        self.interval_background_local_cpu_evict_keys_count = 0
+        self.interval_alloc_fast_fail_count = 0
+        self.interval_allocate_wait_ms = 0.0
 
         self.interval_forced_unpin_count = 0
 
@@ -791,6 +816,10 @@ class LMCStatsMonitor:
             interval_local_cpu_evict_count=self.interval_local_cpu_evict_count,
             interval_local_cpu_evict_keys_count=self.interval_local_cpu_evict_keys_count,
             interval_local_cpu_evict_failed_count=self.interval_local_cpu_evict_failed_count,
+            interval_background_local_cpu_evict_count=self.interval_background_local_cpu_evict_count,  # noqa: E501
+            interval_background_local_cpu_evict_keys_count=self.interval_background_local_cpu_evict_keys_count,  # noqa: E501
+            interval_alloc_fast_fail_count=self.interval_alloc_fast_fail_count,
+            interval_allocate_wait_ms=self.interval_allocate_wait_ms,
             interval_forced_unpin_count=self.interval_forced_unpin_count,
             local_cache_usage_bytes=self.local_cache_usage_bytes,
             remote_cache_usage_bytes=self.remote_cache_usage_bytes,
@@ -1025,6 +1054,30 @@ class PrometheusLogger:
         self.counter_local_cpu_evict_failed_count = self._create_counter(
             name="lmcache:local_cpu_evict_failed_count",
             documentation="Total number of failed eviction in local cpu backend",
+            labelnames=labelnames,
+        )
+
+        self.counter_background_local_cpu_evict_count = self._create_counter(
+            name="lmcache:background_local_cpu_evict_count",
+            documentation="Total number of background evictions in local cpu backend",
+            labelnames=labelnames,
+        )
+
+        self.counter_background_local_cpu_evict_keys_count = self._create_counter(
+            name="lmcache:background_local_cpu_evict_keys_count",
+            documentation="Total number of keys evicted by background evictor",
+            labelnames=labelnames,
+        )
+
+        self.counter_alloc_fast_fail_count = self._create_counter(
+            name="lmcache:alloc_fast_fail_count",
+            documentation="Total number of allocation fast-fail events",
+            labelnames=labelnames,
+        )
+
+        self.counter_allocate_wait_ms = self._create_counter(
+            name="lmcache:allocate_wait_ms",
+            documentation="Total allocation wait time in milliseconds",
             labelnames=labelnames,
         )
 
@@ -1705,6 +1758,22 @@ class PrometheusLogger:
         self._log_counter(
             self.counter_local_cpu_evict_failed_count,
             stats.interval_local_cpu_evict_failed_count,
+        )
+        self._log_counter(
+            self.counter_background_local_cpu_evict_count,
+            stats.interval_background_local_cpu_evict_count,
+        )
+        self._log_counter(
+            self.counter_background_local_cpu_evict_keys_count,
+            stats.interval_background_local_cpu_evict_keys_count,
+        )
+        self._log_counter(
+            self.counter_alloc_fast_fail_count,
+            stats.interval_alloc_fast_fail_count,
+        )
+        self._log_counter(
+            self.counter_allocate_wait_ms,
+            stats.interval_allocate_wait_ms,
         )
         self._log_counter(
             self.counter_forced_unpin_count,

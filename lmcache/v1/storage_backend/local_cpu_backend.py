@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-import keyword
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading
 import time
@@ -89,6 +88,48 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # (only one worker per cache engine)
         self.keys_in_request: List[CacheEngineKey] = []
 
+        self.evict_retry_interval_ms = max(
+            1,
+            int(config.get_extra_config_value("local_cpu.evict_retry_interval_ms", 100)),
+        )
+        self.evict_max_wait_ms = max(
+            0,
+            int(config.get_extra_config_value("local_cpu.evict_max_wait_ms", 0)),
+        )
+        self.evict_batch_candidates = max(
+            1,
+            int(config.get_extra_config_value("local_cpu.evict_batch_candidates", 16)),
+        )
+        self.background_evict_enabled = self._parse_bool(
+            config.get_extra_config_value("local_cpu.background_evict_enabled", True)
+        )
+        self.evict_high_watermark = float(
+            config.get_extra_config_value("local_cpu.evict_high_watermark", 0.92)
+        )
+        self.evict_low_watermark = float(
+            config.get_extra_config_value("local_cpu.evict_low_watermark", 0.82)
+        )
+        if (
+            self.evict_low_watermark <= 0
+            or self.evict_high_watermark >= 1
+            or self.evict_low_watermark >= self.evict_high_watermark
+        ):
+            logger.warning(
+                "Invalid local_cpu eviction watermarks low=%s high=%s, "
+                "fallback to defaults (0.82, 0.92)",
+                self.evict_low_watermark,
+                self.evict_high_watermark,
+            )
+            self.evict_low_watermark = 0.82
+            self.evict_high_watermark = 0.92
+
+        self._background_layer_batch_size = (
+            metadata.kv_shape[0] if self.layerwise and metadata is not None else None
+        )
+        self._background_evict_event = threading.Event()
+        self._background_evict_stop_event = threading.Event()
+        self._background_evict_thread: Optional[threading.Thread] = None
+
         # Batched message sender for controller communication
         self.batched_msg_sender: Optional[BatchedMessageSender] = None
 
@@ -104,6 +145,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.warning("Controller message sender is not initialized")
 
         self._setup_metrics()
+        self._start_background_evictor_if_enabled()
 
     def _setup_metrics(self):
         prometheus_logger = PrometheusLogger.GetInstanceOrNone()
@@ -114,6 +156,35 @@ class LocalCPUBackend(AllocatorBackendInterface):
             prometheus_logger.local_cpu_keys_in_request_count.set_function(
                 lambda: len(self.keys_in_request)
             )
+
+    @staticmethod
+    def _parse_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def _start_background_evictor_if_enabled(self) -> None:
+        if not self.use_hot or not self.background_evict_enabled:
+            return
+        self._background_evict_thread = threading.Thread(
+            target=self._background_evict_loop,
+            name="lmcache-local-cpu-evictor",
+            daemon=True,
+        )
+        self._background_evict_thread.start()
+
+    def _stop_background_evictor(self) -> None:
+        self._background_evict_stop_event.set()
+        self._background_evict_event.set()
+        if self._background_evict_thread is not None:
+            self._background_evict_thread.join(timeout=1.0)
+            self._background_evict_thread = None
+
+    def _signal_background_evictor(self) -> None:
+        if self._background_evict_thread is not None:
+            self._background_evict_event.set()
 
     def __str__(self):
         return self.__class__.__name__
@@ -177,6 +248,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 on_complete_callback(key)
             except Exception as e:
                 logger.warning(f"on_complete_callback failed for key {key}: {e}")
+
+        if stored and self._memory_pressure_above(self.evict_high_watermark):
+            self._signal_background_evictor()
 
         return None
 
@@ -266,19 +340,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return True
 
     def remove(self, key: CacheEngineKey, force: bool = True) -> bool:
+        memory_obj = None
         if force:
-            self.cpu_lock.acquire()
-        if key not in self.hot_cache:
-            if force:
-                self.cpu_lock.release()
-            return False
+            with self.cpu_lock:
+                memory_obj = self.hot_cache.pop(key, None)
+                if memory_obj is None:
+                    return False
+                self.cache_policy.update_on_force_evict(key)
+        else:
+            memory_obj = self.hot_cache.pop(key, None)
+            if memory_obj is None:
+                return False
 
-        memory_obj = self.hot_cache.pop(key)
         memory_obj.ref_count_down()
-
-        if force:
-            self.cache_policy.update_on_force_evict(key)
-            self.cpu_lock.release()
 
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.add_kv_op(
@@ -289,6 +363,44 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.
         return True
+
+    def batched_remove(
+        self,
+        keys: list[CacheEngineKey],
+        force: bool = True,
+    ) -> int:
+        if not keys:
+            return 0
+
+        removed_keys: list[CacheEngineKey] = []
+        removed_mem_objs: list[MemoryObj] = []
+        if force:
+            with self.cpu_lock:
+                for key in keys:
+                    memory_obj = self.hot_cache.pop(key, None)
+                    if memory_obj is None:
+                        continue
+                    self.cache_policy.update_on_force_evict(key)
+                    removed_keys.append(key)
+                    removed_mem_objs.append(memory_obj)
+        else:
+            for key in keys:
+                memory_obj = self.hot_cache.pop(key, None)
+                if memory_obj is None:
+                    continue
+                removed_keys.append(key)
+                removed_mem_objs.append(memory_obj)
+
+        for memory_obj in removed_mem_objs:
+            memory_obj.ref_count_down()
+
+        if self.batched_msg_sender is not None:
+            for key in removed_keys:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.EVICT,
+                    key=key.chunk_hash,
+                )
+        return len(removed_keys)
 
     def _calculate_effective_cpu_size(
         self,
@@ -491,6 +603,173 @@ class LocalCPUBackend(AllocatorBackendInterface):
             )
         return rust_block_align
 
+    def _allocator_total_bytes(self) -> int:
+        if hasattr(self.memory_allocator, "size"):
+            return int(getattr(self.memory_allocator, "size"))
+
+        cpu_allocator = getattr(self.memory_allocator, "cpu_allocator", None)
+        if cpu_allocator is not None and hasattr(cpu_allocator, "buffer_size"):
+            return int(getattr(cpu_allocator, "buffer_size"))
+
+        buffer = getattr(self.memory_allocator, "buffer", None)
+        if isinstance(buffer, torch.Tensor):
+            return int(buffer.numel() * buffer.element_size())
+        return 0
+
+    def _allocator_used_bytes(self) -> int:
+        pin_allocator = getattr(self.memory_allocator, "pin_allocator", None)
+        if pin_allocator is not None and hasattr(pin_allocator, "total_allocated_size"):
+            return int(getattr(pin_allocator, "total_allocated_size"))
+
+        if hasattr(self.memory_allocator, "total_allocated_size"):
+            return int(getattr(self.memory_allocator, "total_allocated_size"))
+
+        cpu_allocator = getattr(self.memory_allocator, "cpu_allocator", None)
+        if cpu_allocator is not None and hasattr(cpu_allocator, "total_allocated_size"):
+            return int(getattr(cpu_allocator, "total_allocated_size"))
+        return 0
+
+    def _allocator_usage_ratio(self) -> float:
+        total = self._allocator_total_bytes()
+        if total <= 0:
+            return 0.0
+        return self._allocator_used_bytes() / total
+
+    def _memory_pressure_above(self, watermark: float) -> bool:
+        return self._allocator_usage_ratio() >= watermark
+
+    def _detach_evictable_entries(
+        self,
+        num_candidates: int,
+        layer_batch_size: Optional[int] = None,
+    ) -> tuple[list[CacheEngineKey], list[MemoryObj], int]:
+        if not self.use_hot:
+            return [], [], 0
+
+        with self.cpu_lock:
+            evict_keys = self.cache_policy.get_evict_candidates(
+                self.hot_cache, num_candidates=num_candidates
+            )
+            detached_keys: list[CacheEngineKey] = []
+            detached_mem_objs: list[MemoryObj] = []
+
+            for evict_key in evict_keys:
+                keys_to_evict = (
+                    evict_key.split_layers(layer_batch_size)
+                    if layer_batch_size is not None
+                    else [evict_key]
+                )
+                for key in keys_to_evict:
+                    memory_obj = self.hot_cache.get(key)
+                    if memory_obj is None:
+                        self.cache_policy.update_on_force_evict(key)
+                        continue
+                    if not memory_obj.can_evict:
+                        continue
+                    self.hot_cache.pop(key, None)
+                    self.cache_policy.update_on_force_evict(key)
+                    detached_keys.append(key)
+                    detached_mem_objs.append(memory_obj)
+
+        return detached_keys, detached_mem_objs, len(evict_keys)
+
+    def _finalize_evicted_entries(
+        self,
+        evicted_keys: list[CacheEngineKey],
+        evicted_memory_objs: list[MemoryObj],
+    ) -> int:
+        if not evicted_memory_objs:
+            return 0
+
+        for memory_obj in evicted_memory_objs:
+            memory_obj.ref_count_down()
+
+        if self.batched_msg_sender is not None:
+            for key in evicted_keys:
+                self.batched_msg_sender.add_kv_op(
+                    op_type=OpType.EVICT,
+                    key=key.chunk_hash,
+                )
+        return len(evicted_memory_objs)
+
+    def _evict_once(
+        self,
+        num_candidates: int,
+        layer_batch_size: Optional[int] = None,
+    ) -> tuple[int, int]:
+        detached_keys, detached_mem_objs, requested_candidates = (
+            self._detach_evictable_entries(
+                num_candidates=num_candidates,
+                layer_batch_size=layer_batch_size,
+            )
+        )
+        if not detached_mem_objs:
+            return 0, requested_candidates
+
+        evicted_count = self._finalize_evicted_entries(detached_keys, detached_mem_objs)
+        logger.debug("Evicted %d chunks from local cpu backend", evicted_count)
+        return evicted_count, requested_candidates
+
+    def _wait_for_retry(self, started_at: float, busy_loop: bool) -> bool:
+        if not busy_loop:
+            logger.debug("Not busy looping because we are not immediately able to evict")
+            return False
+
+        elapsed_ms = (time.monotonic() - started_at) * 1000
+        if self.evict_max_wait_ms > 0 and elapsed_ms >= self.evict_max_wait_ms:
+            logger.warning(
+                "Stop waiting for local cpu eviction after %.2fms (max=%dms)",
+                elapsed_ms,
+                self.evict_max_wait_ms,
+            )
+            self.stats_monitor.update_alloc_fast_fail_count(1)
+            return False
+
+        wait_seconds = self.evict_retry_interval_ms / 1000.0
+        logger.warning(
+            "No eviction candidates found in local cpu backend. "
+            "Local cpu memory is under pressure. Waiting for %.3f seconds.",
+            wait_seconds,
+        )
+        # do not hold the lock during sleep
+        time.sleep(wait_seconds)
+        self.stats_monitor.update_allocate_wait_ms(wait_seconds * 1000)
+        return True
+
+    def _background_evict_loop(self) -> None:
+        while not self._background_evict_stop_event.is_set():
+            signaled = self._background_evict_event.wait(timeout=1.0)
+            self._background_evict_event.clear()
+            if self._background_evict_stop_event.is_set():
+                break
+
+            if not signaled and not self._memory_pressure_above(
+                self.evict_high_watermark
+            ):
+                continue
+
+            # Allocation failure can be caused by fragmentation even when the
+            # aggregate usage is below the high watermark, so a direct signal is
+            # allowed to evict one batch before falling back to low-watermark checks.
+            force_once = signaled
+            while not self._background_evict_stop_event.is_set():
+                if not force_once and not self._memory_pressure_above(
+                    self.evict_low_watermark
+                ):
+                    break
+                force_once = False
+
+                evicted_count, requested = self._evict_once(
+                    num_candidates=self.evict_batch_candidates,
+                    layer_batch_size=self._background_layer_batch_size,
+                )
+                if evicted_count == 0:
+                    self.stats_monitor.update_local_cpu_evict_failed_count(requested)
+                    break
+                self.stats_monitor.update_background_local_cpu_evict(
+                    evicted_count=evicted_count
+                )
+
     @_lmcache_nvtx_annotate
     def allocate(
         self,
@@ -531,55 +810,27 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 fmt = MemoryFormat.KV_2LTD
 
         memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
-        if memory_obj is not None or not eviction:
+        if memory_obj is not None:
+            if self._memory_pressure_above(self.evict_high_watermark):
+                self._signal_background_evictor()
+            return memory_obj
+        if not eviction:
             return memory_obj
 
+        self._signal_background_evictor()
         evict_keys_count = 0
         num_attempts = 0
+        started_at = time.monotonic()
         while True:
-            # whether or not this request needs to wait or other requests
-            wait_other_requests = True
-            if self.use_hot:
-                # TODO(Jiayi): optimize `num_candidates` with estimation.
-                # Accurate estimation is hard due to fragmentation
-                num_candidates = 1
-                evict_keys = None
-                with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
-                    if evict_keys:
-                        # we can continue trying to evict from the hot_cache
-                        # and don't need to wait for other requests yet
-                        wait_other_requests = False
-                        logger.debug(
-                            f"Evicting {len(evict_keys)} chunks from cpu memory"
-                        )
-                        # remove
-                        self.batched_remove(evict_keys, force=False)
-                        evict_keys_count += len(evict_keys)
-                    else:
-                        self.stats_monitor.update_local_cpu_evict_failed_count(
-                            num_candidates
-                        )
-
-            if wait_other_requests:
-                if not busy_loop:
-                    logger.debug(
-                        "Not busy looping because we are not immediately able to evict"
-                    )
+            evicted_count, requested = self._evict_once(
+                num_candidates=self.evict_batch_candidates,
+            )
+            if evicted_count > 0:
+                evict_keys_count += evicted_count
+            else:
+                self.stats_monitor.update_local_cpu_evict_failed_count(requested)
+                if not self._wait_for_retry(started_at=started_at, busy_loop=busy_loop):
                     break
-
-                # TODO: make time_to_wait a config
-                time_to_wait = 0.1
-                logger.warning(
-                    "No eviction candidates found in local cpu backend. "
-                    "Local cpu memory is under pressure. "
-                    f"Waiting for {time_to_wait} seconds before retrying."
-                )
-                # self.memory_allocator.memcheck()
-                # do not hold the lock during sleep
-                time.sleep(time_to_wait)
 
             memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
             if memory_obj is not None:
@@ -590,6 +841,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 f"Unable to allocate memory object after {num_attempts}"
                 " attempts of local cpu backend allocate()"
             )
+            self._signal_background_evictor()
 
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_obj
@@ -639,71 +891,28 @@ class LocalCPUBackend(AllocatorBackendInterface):
             shapes, dtypes, batch_size, fmt
         )
 
-        if memory_objs is not None or not eviction:
+        if memory_objs is not None:
+            if self._memory_pressure_above(self.evict_high_watermark):
+                self._signal_background_evictor()
+            return memory_objs
+        if not eviction:
             return memory_objs
 
-        assert isinstance(self.memory_allocator, MixedMemoryAllocator)
-
+        self._signal_background_evictor()
         evict_keys_count = 0
         num_attempts = 0
+        started_at = time.monotonic()
         while True:
-            wait_other_requests = True
-            if self.use_hot:
-                # TODO(Jiayi): optimize `num_candidates` with estimation.
-                # Accurate estimation is hard due to fragmentation
-                num_candidates = 1
-                evict_keys = None
-                with self.cpu_lock:
-                    evict_keys = self.cache_policy.get_evict_candidates(
-                        self.hot_cache, num_candidates=num_candidates
-                    )
-
-                    # HACK: We assume batch_size=num_layers here.
-                    # FIXME: We also assume if the one layer's ref_count > 1 or pinned,
-                    # then the other layers are also ref_count > 1 or
-                    # pinned in the cpu memory. This might not be true.
-                    if evict_keys:
-                        evict_keys_count += len(evict_keys)
-                        wait_other_requests = False
-                        for evict_key in evict_keys:
-                            evict_key_all_layer = evict_key.split_layers(batch_size)
-
-                            # TODO(Jiayi): batched allocate is not supported through
-                            # `batched_remove`. Therefore, features like usage tracking
-                            # is not supported.
-                            old_mem_objs = []
-                            for key in evict_key_all_layer:
-                                old_mem_objs.append(self.hot_cache[key])
-                                self.cache_policy.update_on_force_evict(key)
-                                self.hot_cache.pop(key, None)
-
-                            self.memory_allocator.batched_free(old_mem_objs)
-
-                            logger.debug(
-                                f"Evicting {len(old_mem_objs)} chunks from cpu memory"
-                            )
-                    else:
-                        self.stats_monitor.update_local_cpu_evict_failed_count(
-                            num_candidates
-                        )
-
-            if wait_other_requests:
-                if not busy_loop:
-                    logger.debug(
-                        "Not busy looping because we are not immediately able to evict"
-                    )
+            evicted_count, requested = self._evict_once(
+                num_candidates=self.evict_batch_candidates,
+                layer_batch_size=batch_size,
+            )
+            if evicted_count > 0:
+                evict_keys_count += evicted_count
+            else:
+                self.stats_monitor.update_local_cpu_evict_failed_count(requested)
+                if not self._wait_for_retry(started_at=started_at, busy_loop=busy_loop):
                     break
-
-                # TODO: make time_to_wait a config
-                time_to_wait = 0.1
-                logger.warning(
-                    "No eviction candidates found in local cpu backend. "
-                    "Local cpu memory is under pressure. "
-                    f"Waiting for {time_to_wait} seconds before retrying."
-                )
-                # self.memory_allocator.memcheck()
-                # do not hold the lock during sleep
-                time.sleep(time_to_wait)
 
             memory_objs = self.memory_allocator.batched_allocate(
                 shapes, dtypes, batch_size, fmt
@@ -716,6 +925,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 f"Unable to allocate memory object after {num_attempts}"
                 " attempts of local cpu backend batched_allocate()"
             )
+            self._signal_background_evictor()
         self.stats_monitor.update_local_cpu_evict_metrics(evict_keys_count)
         return memory_objs
 
@@ -810,7 +1020,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         return self.memory_allocator
 
     def close(self) -> None:
+        self._stop_background_evictor()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
-        self.memory_allocator.close()
         self.clear()
+        self.memory_allocator.close()

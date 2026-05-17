@@ -3,6 +3,7 @@ local_cpu: True
 max_local_cpu_size: 50
 # enable_async_loading: True
 
+enable_kv_events: true
 pre_caching_hash_algorithm: "sha256_cbor"
 
 # P2P configurations

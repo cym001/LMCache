@@ -33,6 +33,11 @@ except ImportError:
     )
 
 from lmcache.logging import init_logger
+from lmcache.v1.kv_transfer_status import (
+    KV_TRANSFER_ALREADY_SATISFIED,
+    KV_TRANSFER_FAILED,
+    KV_TRANSFER_NOT_FOUND,
+)
 
 logger = init_logger(__name__)
 HashValue = Union[int, bytes]
@@ -119,30 +124,31 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
             # Validate inputs
             if not hashes:
                 logger.warning("TransferKv: No hashes provided")
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvserver_pb2.TransferKvResponse(status=KV_TRANSFER_FAILED)
             
             if not offsets:
                 logger.warning("TransferKv: No offsets provided")
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvserver_pb2.TransferKvResponse(status=KV_TRANSFER_FAILED)
             
             if len(hashes) != len(offsets):
                 logger.warning(
                     f"TransferKv: Mismatch between hashes ({len(hashes)}) "
                     f"and offsets ({len(offsets)})"
                 )
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvserver_pb2.TransferKvResponse(status=KV_TRANSFER_FAILED)
             
             if not target_ip or target_port <= 0:
                 logger.warning(
                     f"TransferKv: Invalid target: {target_ip}:{target_port}"
                 )
-                return kvserver_pb2.TransferKvResponse(status=-2)
+                return kvserver_pb2.TransferKvResponse(status=KV_TRANSFER_FAILED)
             
             # Call the cache engine's kv_transfer method
             # Returns:
-            #   -1 if KV cache does not exist
-            #   -2 if transfer failed for other reasons
-            #   >0 number of tokens successfully transferred
+            #   KV_TRANSFER_NOT_FOUND if source KV cache does not exist
+            #   KV_TRANSFER_FAILED if transfer failed for other reasons
+            #   KV_TRANSFER_ALREADY_SATISFIED if target already has all chunks
+            #   Other positive values: number of tokens successfully transferred
             num_tokens = self.cache_engine.kv_transfer(
                 hashes=hashes,
                 offsets=offsets,
@@ -153,7 +159,7 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                 do_copy=do_copy,
                 token_ids=token_ids,
             )
-            if num_tokens == -1:
+            if num_tokens == KV_TRANSFER_NOT_FOUND:
                 fallback_hashes = self._convert_hashes_to_int(hashes)
                 logger.info(
                     "TransferKv retry with int hashes for type compatibility."
@@ -169,21 +175,23 @@ class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
                     token_ids=token_ids,
                 )
             
-            # logger.info(
-            #     f"TransferKv completed: result={num_tokens} tokens"
-            # )
-            
+            if num_tokens == KV_TRANSFER_ALREADY_SATISFIED:
+                logger.info(
+                    "TransferKv completed: target already has all requested chunks"
+                )
+
             # Return status directly from kv_transfer
-            # -1: KV cache does not exist
-            # -2: Transfer failed for other reasons
-            # >0: Number of tokens transferred successfully
+            # KV_TRANSFER_NOT_FOUND: source KV cache does not exist
+            # KV_TRANSFER_FAILED: transfer failed for other reasons
+            # KV_TRANSFER_ALREADY_SATISFIED: target already has all requested chunks
+            # Other positive values: number of tokens transferred successfully
             return kvserver_pb2.TransferKvResponse(status=num_tokens)
             
         except Exception as e:
             logger.error(f"TransferKv failed with exception: {e}", exc_info=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return kvserver_pb2.TransferKvResponse(status=-2)
+            return kvserver_pb2.TransferKvResponse(status=KV_TRANSFER_FAILED)
     
     def _parse_hashes(self, hash_bytes: bytes, num_hashes: int) -> List[bytes]:
         """

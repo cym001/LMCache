@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 import threading
+import time
 
 # Third Party
 import pytest
@@ -39,6 +40,30 @@ class MockLMCacheWorker:
     def put_msg(self, msg):
         with self._lock:
             self.messages.append(msg)
+
+
+class AlwaysOOMAllocator:
+    def __init__(self):
+        self.allocate_calls = 0
+        self.batched_allocate_calls = 0
+
+    def allocate(self, *args, **kwargs):
+        self.allocate_calls += 1
+        return None
+
+    def batched_allocate(self, *args, **kwargs):
+        self.batched_allocate_calls += 1
+        return None
+
+    def close(self):
+        return None
+
+
+class PressureAllocator(AlwaysOOMAllocator):
+    def __init__(self, size: int, used: int):
+        super().__init__()
+        self.size = size
+        self.pin_allocator = type("PinAllocator", (), {"total_allocated_size": used})()
 
 
 def create_test_config(
@@ -445,6 +470,111 @@ class TestLocalCPUBackend:
 
         local_cpu_backend.memory_allocator.close()
 
+    def test_allocate_fast_fail_when_busy_loop_disabled(self):
+        config = create_test_config()
+        config.extra_config = {
+            "local_cpu.background_evict_enabled": False,
+            "local_cpu.evict_batch_candidates": 8,
+        }
+        backend = LocalCPUBackend(config=config, memory_allocator=AlwaysOOMAllocator())
+
+        result = backend.allocate(
+            torch.Size([2, 16, 8, 128]),
+            torch.bfloat16,
+            busy_loop=False,
+        )
+
+        assert result is None
+        assert backend.memory_allocator.allocate_calls == 1
+        backend.close()
+
+    def test_allocate_respects_evict_max_wait_ms(self, monkeypatch):
+        config = create_test_config()
+        config.extra_config = {
+            "local_cpu.background_evict_enabled": False,
+            "local_cpu.evict_retry_interval_ms": 1,
+            "local_cpu.evict_max_wait_ms": 2,
+        }
+        backend = LocalCPUBackend(config=config, memory_allocator=AlwaysOOMAllocator())
+
+        fake_clock = {"now": 0.0}
+
+        def _fake_monotonic():
+            return fake_clock["now"]
+
+        def _fake_sleep(wait_seconds: float):
+            fake_clock["now"] += wait_seconds
+
+        monkeypatch.setattr(local_cpu_backend_module.time, "monotonic", _fake_monotonic)
+        monkeypatch.setattr(local_cpu_backend_module.time, "sleep", _fake_sleep)
+
+        result = backend.allocate(
+            torch.Size([2, 16, 8, 128]),
+            torch.bfloat16,
+            busy_loop=True,
+        )
+
+        assert result is None
+        assert backend.memory_allocator.allocate_calls >= 2
+        stats = backend.stats_monitor.get_stats_and_clear()
+        assert stats.interval_alloc_fast_fail_count >= 1
+        backend.close()
+
+    def test_background_evictor_evicts_in_batches(self, monkeypatch):
+        config = create_test_config()
+        config.extra_config = {
+            "local_cpu.background_evict_enabled": True,
+            "local_cpu.evict_high_watermark": 0.5,
+            "local_cpu.evict_low_watermark": 0.2,
+            "local_cpu.evict_batch_candidates": 4,
+        }
+        backend = LocalCPUBackend(
+            config=config,
+            memory_allocator=PressureAllocator(size=100, used=90),
+        )
+        evict_calls = {"count": 0}
+
+        def _fake_evict_once(num_candidates: int, layer_batch_size=None):
+            evict_calls["count"] += 1
+            backend.memory_allocator.pin_allocator.total_allocated_size = 0
+            return 3, num_candidates
+
+        monkeypatch.setattr(backend, "_evict_once", _fake_evict_once)
+        backend._signal_background_evictor()
+
+        deadline = time.time() + 1.0
+        while evict_calls["count"] == 0 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert evict_calls["count"] > 0
+        stats = backend.stats_monitor.get_stats_and_clear()
+        assert stats.interval_background_local_cpu_evict_count >= 1
+        assert stats.interval_background_local_cpu_evict_keys_count >= 3
+        backend.close()
+
+    def test_background_evictor_does_not_evict_on_idle_timeout(self, monkeypatch):
+        config = create_test_config()
+        config.extra_config = {
+            "local_cpu.background_evict_enabled": True,
+            "local_cpu.evict_high_watermark": 0.9,
+            "local_cpu.evict_low_watermark": 0.8,
+        }
+        backend = LocalCPUBackend(
+            config=config,
+            memory_allocator=PressureAllocator(size=100, used=10),
+        )
+        evict_calls = {"count": 0}
+
+        def _fake_evict_once(num_candidates: int, layer_batch_size=None):
+            evict_calls["count"] += 1
+            return 1, num_candidates
+
+        monkeypatch.setattr(backend, "_evict_once", _fake_evict_once)
+        time.sleep(1.2)
+
+        assert evict_calls["count"] == 0
+        backend.close()
+
     def test_get_keys(self, local_cpu_backend):
         """Test get_keys()."""
         keys = [create_test_key(f"key_{i}") for i in range(3)]
@@ -543,6 +673,76 @@ class TestLocalCPUBackend:
         local_cpu_backend.memory_allocator.close()
 
 
+class TestLocalCPUBackendAllocatorAlignment:
+    def test_rust_odirect_auto_alignment_for_mixed_allocator(self, monkeypatch):
+        config = create_test_config(local_cpu=True)
+        config.max_local_cpu_size = 0.01
+        config.extra_config = {
+            "rust_raw_block.device_path": "/tmp/dev.bin",
+            "rust_raw_block.use_odirect": True,
+            "rust_raw_block.block_align": 4096,
+        }
+        metadata = create_test_metadata()
+
+        captured: dict[str, object] = {}
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                captured["size"] = size
+                captured["kwargs"] = kwargs
+                self.align_bytes = kwargs.get("align_bytes", 4096)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+        try:
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert kwargs.get("align_bytes") == 4096
+        finally:
+            backend.memory_allocator.close()
+
+    def test_explicit_alignment_override_for_mixed_allocator(self, monkeypatch):
+        config = create_test_config(local_cpu=True)
+        config.max_local_cpu_size = 0.01
+        config.extra_config = {
+            "local_cpu.pinned_align_bytes": 4096,
+            "rust_raw_block.device_path": "/tmp/dev.bin",
+            "rust_raw_block.use_odirect": False,
+        }
+        metadata = create_test_metadata()
+
+        captured: dict[str, object] = {}
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                captured["size"] = size
+                captured["kwargs"] = kwargs
+                self.align_bytes = kwargs.get("align_bytes", 4096)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+        try:
+            kwargs = captured["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert kwargs.get("align_bytes") == 4096
+        finally:
+            backend.memory_allocator.close()
 class TestLocalCPUBackendAllocatorAlignment:
     def test_rust_odirect_auto_alignment_for_mixed_allocator(self, monkeypatch):
         config = create_test_config(local_cpu=True)

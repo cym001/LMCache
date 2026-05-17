@@ -48,6 +48,11 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.kv_transfer_status import (
+    KV_TRANSFER_ALREADY_SATISFIED,
+    KV_TRANSFER_FAILED,
+    KV_TRANSFER_NOT_FOUND,
+)
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
@@ -78,6 +83,37 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+def _kv_event_hash_to_u64(value: Any) -> int:
+    """Normalize LMCache hash values to Dynamo's u64 event hash format."""
+    if value is None:
+        raise TypeError("KV event block hash cannot be None")
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        hash_bytes = bytes(value)
+    elif isinstance(value, list):
+        hash_bytes = bytes(value)
+    else:
+        raise TypeError(f"Unsupported KV event hash type: {type(value)!r}")
+
+    if len(hash_bytes) < 8:
+        hash_bytes = hash_bytes.rjust(8, b"\x00")
+    return int.from_bytes(hash_bytes[:8], byteorder="big", signed=False)
+
+
+def _kv_event_parent_hash_to_u64(value: Any) -> int | None:
+    if value is None:
+        return None
+    return _kv_event_hash_to_u64(value)
+
+
+def _normalize_kv_event_hashes(event: CacheStoreEvent) -> CacheStoreEvent:
+    event.block_hashes = [_kv_event_hash_to_u64(item) for item in event.block_hashes]
+    event.parent_block_hash = _kv_event_parent_hash_to_u64(event.parent_block_hash)
+    return event
 
 
 @dataclass
@@ -617,7 +653,7 @@ class LMCacheEngine:
             assert isinstance(request_configs, dict)
 
         with store_stats.profile_process_tokens():
-            prev_key = 0
+            prev_key: Any | None = None
             for start, end, key in self.token_database.process_tokens(
                 tokens,
                 hashes,
@@ -660,7 +696,7 @@ class LMCacheEngine:
                 if self.kv_events_enabled:
                     stored_event = CacheStoreEvent(
                         block_hashes=[key.chunk_hash],
-                        parent_block_hash=None if start == 0 else prev_key,
+                        parent_block_hash=prev_key,
                         token_ids=[],
                         block_size=num_tokens,
                         lora_id=None,
@@ -790,7 +826,7 @@ class LMCacheEngine:
         """
         if self._migration_worker_shutdown:
             logger.warning("KV transfer rejected because migration worker is stopped")
-            return -2
+            return KV_TRANSFER_FAILED
 
         job = _KvTransferJob(
             hashes=hashes,
@@ -825,7 +861,7 @@ class LMCacheEngine:
                 "KV transfer is not performed as there are no tokens to "
                 "transfer. KV cache does not exist."
             )
-            return -1
+            return KV_TRANSFER_NOT_FOUND
 
         try:
             block_mapping = self.lookup_pins[job.event_id]
@@ -838,7 +874,7 @@ class LMCacheEngine:
                     "KV transfer is not performed as no matching keys were found "
                     f"in {job.old_position}."
                 )
-                return -1
+                return KV_TRANSFER_NOT_FOUND
 
             # Step 2: Get memory objects from the source location
             memory_objs = self.storage_manager.batched_get(
@@ -847,7 +883,7 @@ class LMCacheEngine:
             )
             if memory_objs is None or any(obj is None for obj in memory_objs):
                 logger.error("Failed to get memory objects to transfer")
-                return -2
+                return KV_TRANSFER_FAILED
             transfer_objs = [obj for obj in memory_objs if obj is not None]
             logger.info(
                 f"Trying to transfer {len(transfer_objs)} memory objects to "
@@ -871,7 +907,7 @@ class LMCacheEngine:
                 logger.error(
                     "KvTransferBackend is not available in storage backends"
                 )
-                return -2
+                return KV_TRANSFER_FAILED
 
             # Step 5: Execute the transfer asynchronously
             try:
@@ -888,18 +924,35 @@ class LMCacheEngine:
                     self.storage_manager.loop,
                 )
 
-                num_transferred = future.result()
+                transfer_result = future.result()
+                num_satisfied = transfer_result.num_satisfied_chunks
+                transfer_status = num_tokens
 
-                if num_transferred != len(keys):
+                if num_satisfied != len(keys):
                     logger.warning(
-                        f"Only {num_transferred}/{len(keys)} chunks were "
-                        f"transferred successfully"
+                        "Only %d/%d chunks were satisfied by peer "
+                        "(%d newly read, %d already existed)",
+                        num_satisfied,
+                        len(keys),
+                        transfer_result.num_read_chunks,
+                        transfer_result.num_existing_chunks,
                     )
-                    if num_transferred == 0:
-                        return -2
+                    if num_satisfied == 0:
+                        return KV_TRANSFER_FAILED
+                elif transfer_result.all_already_satisfied:
+                    logger.info(
+                        "KV transfer already satisfied: peer %s:%s already "
+                        "has all %d requested chunks",
+                        job.peer_ip,
+                        job.peer_init_port,
+                        len(keys),
+                    )
+                    transfer_status = KV_TRANSFER_ALREADY_SATISFIED
+                else:
+                    transfer_status = num_tokens
             except Exception as e:
                 logger.error(f"KV transfer failed with exception: {e}")
-                return -2
+                return KV_TRANSFER_FAILED
 
             # Step 6: Optionally remove from source (if move instead of copy)
             # Unpin before batched_remove so backends can still resolve keys
@@ -915,10 +968,10 @@ class LMCacheEngine:
                 )
 
             logger.info(
-                f"KV transfer completed: {num_tokens} tokens transferred from "
+                f"KV transfer completed: status={transfer_status} from "
                 f"{job.old_position} to peer {job.peer_ip}:{job.peer_init_port}"
             )
-            return num_tokens
+            return transfer_status
         finally:
             self.lookup_unpin(job.event_id)
             if memory_objs is not None:
@@ -1048,7 +1101,7 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
-        prev_key = 0
+        prev_key: Any | None = None
         for start, end, key in self.token_database.process_tokens(
             tokens=tokens, mask=mask, request_configs=request_configs
         ):
@@ -1090,7 +1143,7 @@ class LMCacheEngine:
             if self.kv_events_enabled and tokens is not None:
                 stored_event = CacheStoreEvent(
                     block_hashes=[key.chunk_hash],
-                    parent_block_hash=None if start == 0 else prev_key,
+                    parent_block_hash=prev_key,
                     token_ids=[],
                     block_size=num_tokens,
                     lora_id=None,
@@ -1898,7 +1951,7 @@ class LMCacheEngine:
     def get_kv_events(self) -> Iterable[CacheStoreEvent]:
         if self.kv_events_enabled and (events := self.kv_events):
             self.kv_events = []
-            return events
+            return [_normalize_kv_event_hashes(event) for event in events]
         return []
 
     def _clear(
