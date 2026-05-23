@@ -1,19 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Standard
+from typing import List
+
+# Third Party
 import grpc
-from typing import List, Dict, Optional, Union
-import logging
-import torch
-import hashlib
-from lmcache.utils import CacheEngineKey
+
+# First Party
 from lmcache.v1.config import LMCacheEngineConfig
 
 try:
     import lmcache.v1.remote.kvcache_pb2 as kvcache_pb2
     import lmcache.v1.remote.kvcache_pb2_grpc as kvcache_pb2_grpc
-except ImportError:
+except ImportError as exc:
     raise ImportError(
         "请先生成proto文件的Python代码:\n"
-        "python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. kvcache.proto"
-    )
+        "python -m grpc_tools.protoc -I. --python_out=. "
+        "--grpc_python_out=. kvcache.proto"
+    ) from exc
 
 
 class KvCacheClient:
@@ -71,32 +74,28 @@ class KvCacheClient:
         response = self.stub.UploadKvMeta(request)
         return response.success
     
-    def remove_kv_meta(self, tokens_hash_list):
+    def remove_kv_meta(self, tokens_hash_list: List[bytes]) -> bool:
         """
-        删除KV缓存元数据
-        
+        删除KV缓存元数据。
+
         Args:
-            tokens_hash_list: token哈希列表，每个哈希应该是32字节的bytes
-        
+            tokens_hash_list: token hash 列表，每个 hash 应为 32 字节 bytes。
+
         Returns:
-            bool: 是否成功
+            bool: 服务端是否处理成功。
         """
-        # 构建请求消息
         request = kvcache_pb2.RemoveKvMetaRequest(
-            id = self.server_id,
+            id=self.server_id,
             remove_nums=len(tokens_hash_list),
-            tokens_hash=tokens_hash_list
+            tokens_hash=tokens_hash_list,
         )
-        
-        # 发送请求
         response = self.stub.RemoveKvMeta(request)
-        return response.success
-        
-    
+        return bool(response.success)
+
     def register_instance(self):
         """
         注册推理实例（使用初始化时的数据服务器信息）
-        
+
         Returns:
             bool: 是否成功
         """
@@ -161,13 +160,13 @@ class KvCacheClient:
     def kvblockmeta_from_key(self, tokens, start, end, kv_ref=1):
         """
         将tokens序列拆分为UploadKvBlockMeta列表
-        
+
         Args:
             tokens: 完整的token序列列表
             start: 起始索引
             end: 结束索引（不包含）
             kv_ref: 引用计数，默认为1
-        
+
         Returns:
             list: UploadKvBlockMeta字典列表，每个字典包含:
                 {
