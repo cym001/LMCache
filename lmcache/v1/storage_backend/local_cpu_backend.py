@@ -40,6 +40,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _chunk_hash_to_32_bytes(chunk_hash: Any) -> bytes:
+    if isinstance(chunk_hash, (bytes, bytearray, memoryview)):
+        hash_bytes = bytes(chunk_hash)
+    elif isinstance(chunk_hash, list):
+        hash_bytes = bytes(chunk_hash)
+    elif isinstance(chunk_hash, int):
+        return (chunk_hash & ((1 << 256) - 1)).to_bytes(
+            32, byteorder="big", signed=False
+        )
+    else:
+        raise TypeError(f"Unsupported chunk hash type: {type(chunk_hash)!r}")
+
+    if len(hash_bytes) < 32:
+        return hash_bytes.rjust(32, b"\x00")
+    if len(hash_bytes) > 32:
+        return hash_bytes[-32:]
+    return hash_bytes
+
+
 class LocalCPUBackend(AllocatorBackendInterface):
     """
     Even if local_cpu is False (the hot_cache is not used), contains(),
@@ -1037,20 +1056,34 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         kv_events = self.kv_events
+        global_kvclient = self.global_kvclient
         self.kv_events = None
+        self.global_kvclient = None
         try:
             self.clear()
         finally:
             self.kv_events = kv_events
+            self.global_kvclient = global_kvclient
         self.memory_allocator.close()
 
     def _publish_remove_event(self, keys: Sequence[CacheEngineKey]) -> None:
-        if self.kv_events is None or not keys:
+        if not keys:
             return
-        self.kv_events.append(
-            CacheRemoveEvent(
-                block_hashes=[key.chunk_hash for key in keys],
-                medium="cpu",
-                group_idx=None,
+
+        block_hashes = [key.chunk_hash for key in keys]
+        if self.kv_events is not None:
+            self.kv_events.append(
+                CacheRemoveEvent(
+                    block_hashes=block_hashes,
+                    medium="cpu",
+                    group_idx=None,
+                )
             )
-        )
+
+        if self.global_kvclient is not None:
+            try:
+                self.global_kvclient.remove_kv_meta(
+                    [_chunk_hash_to_32_bytes(chunk_hash) for chunk_hash in block_hashes]
+                )
+            except Exception as exc:
+                logger.warning("Failed to report removed KV metadata: %s", exc)

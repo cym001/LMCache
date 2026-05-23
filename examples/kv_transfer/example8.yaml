@@ -8,15 +8,15 @@ pre_caching_hash_algorithm: "sha256_cbor"
 
 # P2P configurations
 p2p_host: "localhost"
-p2p_init_ports: 8215
-p2p_lookup_ports: 8216
+p2p_init_ports: 8235
+p2p_lookup_ports: 8236
 
 enable_kv_transfer: True
 kv_transfer_host: "127.0.0.1"
-kv_transfer_http_port: 8013
-kv_transfer_init_port: 8217
-kv_transfer_rpc_port: 8218
-kv_transfer_model_name: "Llama3.1-8b"
+kv_transfer_http_port: 8017
+kv_transfer_init_port: 8237
+kv_transfer_rpc_port: 8238
+kv_transfer_model_name: "DeepSeek-R1-Distill-Qwen-32B"
 transfer_channel: "nixl"
 
 # Controller configurations

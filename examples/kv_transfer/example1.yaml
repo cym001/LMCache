@@ -1,6 +1,6 @@
 chunk_size: 256
 local_cpu: True
-max_local_cpu_size: 50
+max_local_cpu_size: 80
 # enable_async_loading: True
 
 enable_kv_events: true
@@ -16,7 +16,7 @@ kv_transfer_host: "127.0.0.1"
 kv_transfer_http_port: 8010
 kv_transfer_init_port: 8203
 kv_transfer_rpc_port: 8204
-kv_transfer_model_name: "Llama3.1-8b"
+kv_transfer_model_name: "DeepSeek-R1-Distill-Qwen-32B"
 transfer_channel: "nixl"
 
 # Controller configurations
@@ -27,7 +27,7 @@ transfer_channel: "nixl"
 # lmcache_worker_ports: 8500
 
 enable_globalkv_server: true
-globalkv_server_max_workers: 10
+globalkv_server_max_workers: 2
 
 extra_config:
   lookup_backoff_time: 0.001
