@@ -9,7 +9,7 @@ import torch
 
 # First Party
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import CacheEngineKey
+from lmcache.utils import CacheEngineKey, CacheRemoveEvent
 from lmcache.v1.cache_controller.message import BatchedKVOperationMsg, OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_allocators.mixed_memory_allocator import MixedMemoryAllocator
@@ -339,6 +339,9 @@ class TestLocalCPUBackend:
         key = create_test_key("test_key")
         memory_obj = create_test_memory_obj()
 
+        kv_events = []
+        local_cpu_backend.set_kv_events_sink(kv_events)
+
         # Insert key first
         local_cpu_backend.submit_put_task(key, memory_obj)
         assert key in local_cpu_backend.hot_cache
@@ -349,17 +352,121 @@ class TestLocalCPUBackend:
         assert result is True
         assert key not in local_cpu_backend.hot_cache
         assert memory_obj.get_ref_count() == 1  # Should be decremented
+        assert kv_events == [
+            CacheRemoveEvent(
+                block_hashes=[key.chunk_hash],
+                medium="cpu",
+                group_idx=None,
+            )
+        ]
 
         local_cpu_backend.memory_allocator.close()
 
     def test_remove_non_existent(self, local_cpu_backend):
         """Test remove() with non-existent key."""
+        kv_events = []
+        local_cpu_backend.set_kv_events_sink(kv_events)
         key = create_test_key("nonexistent")
         result = local_cpu_backend.remove(key)
 
         assert result is False
+        assert kv_events == []
 
         local_cpu_backend.memory_allocator.close()
+
+    def test_batched_remove_publishes_remove_event(self, local_cpu_backend):
+        keys = [create_test_key(f"remove_key_{idx}") for idx in range(3)]
+        memory_objs = [create_test_memory_obj() for _ in keys]
+        kv_events = []
+        local_cpu_backend.set_kv_events_sink(kv_events)
+
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            local_cpu_backend.submit_put_task(key, memory_obj)
+
+        removed_count = local_cpu_backend.batched_remove(keys)
+
+        assert removed_count == len(keys)
+        assert all(key not in local_cpu_backend.hot_cache for key in keys)
+        assert kv_events == [
+            CacheRemoveEvent(
+                block_hashes=[key.chunk_hash for key in keys],
+                medium="cpu",
+                group_idx=None,
+            )
+        ]
+
+        local_cpu_backend.memory_allocator.close()
+
+    def test_clear_publishes_remove_event(self, local_cpu_backend):
+        keys = [create_test_key(f"clear_key_{idx}") for idx in range(2)]
+        memory_objs = [create_test_memory_obj() for _ in keys]
+        kv_events = []
+        local_cpu_backend.set_kv_events_sink(kv_events)
+
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            local_cpu_backend.submit_put_task(key, memory_obj)
+            memory_obj.ref_count_down()
+
+        cleared_tokens = local_cpu_backend.clear()
+
+        assert cleared_tokens == sum(
+            memory_obj.get_num_tokens() for memory_obj in memory_objs
+        )
+        assert all(key not in local_cpu_backend.hot_cache for key in keys)
+        assert kv_events == [
+            CacheRemoveEvent(
+                block_hashes=[key.chunk_hash for key in keys],
+                medium="cpu",
+                group_idx=None,
+            )
+        ]
+
+        local_cpu_backend.memory_allocator.close()
+
+    def test_allocate_eviction_publishes_remove_event(self):
+        config = create_test_config()
+        config.extra_config = {
+            "local_cpu.background_evict_enabled": False,
+            "local_cpu.evict_batch_candidates": 2,
+        }
+        backend = LocalCPUBackend(config=config, memory_allocator=AlwaysOOMAllocator())
+        keys = [create_test_key(f"evict_key_{idx}") for idx in range(2)]
+        memory_objs = [create_test_memory_obj() for _ in keys]
+        kv_events = []
+        backend.set_kv_events_sink(kv_events)
+
+        for key, memory_obj in zip(keys, memory_objs, strict=False):
+            backend.submit_put_task(key, memory_obj)
+            memory_obj.ref_count_down()
+
+        result = backend.allocate(
+            torch.Size([2, 16, 8, 128]),
+            torch.bfloat16,
+            busy_loop=False,
+        )
+
+        assert result is None
+        assert all(key not in backend.hot_cache for key in keys)
+        assert kv_events == [
+            CacheRemoveEvent(
+                block_hashes=[key.chunk_hash for key in keys],
+                medium="cpu",
+                group_idx=None,
+            )
+        ]
+
+        backend.close()
+
+    def test_close_does_not_publish_remove_event(self, local_cpu_backend):
+        key = create_test_key("close_key")
+        memory_obj = create_test_memory_obj()
+        kv_events = []
+        local_cpu_backend.set_kv_events_sink(kv_events)
+        local_cpu_backend.submit_put_task(key, memory_obj)
+
+        local_cpu_backend.close()
+
+        assert kv_events == []
 
     def test_remove_with_worker(self, memory_allocator, lmcache_engine_metadata):
         """Test remove() with LMCacheWorker."""
