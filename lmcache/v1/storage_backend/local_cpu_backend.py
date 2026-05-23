@@ -12,7 +12,12 @@ import torch
 from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
-from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
+from lmcache.utils import (
+    CacheEngineKey,
+    CacheEvent,
+    CacheRemoveEvent,
+    _lmcache_nvtx_annotate,
+)
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
@@ -87,6 +92,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # assumption: only one request is looked up at a time
         # (only one worker per cache engine)
         self.keys_in_request: List[CacheEngineKey] = []
+        self.kv_events: Optional[List[CacheEvent]] = None
 
         self.evict_retry_interval_ms = max(
             1,
@@ -188,6 +194,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
     def __str__(self):
         return self.__class__.__name__
+
+    def set_kv_events_sink(self, kv_events: List[CacheEvent]) -> None:
+        """Inject the cache engine KV event list for local CPU remove events."""
+        self.kv_events = kv_events
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.cpu_lock:
@@ -353,6 +363,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 return False
 
         memory_obj.ref_count_down()
+        self._publish_remove_event([key])
 
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.add_kv_op(
@@ -393,6 +404,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         for memory_obj in removed_mem_objs:
             memory_obj.ref_count_down()
+        self._publish_remove_event(removed_keys)
 
         if self.batched_msg_sender is not None:
             for key in removed_keys:
@@ -683,6 +695,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         for memory_obj in evicted_memory_objs:
             memory_obj.ref_count_down()
+        self._publish_remove_event(evicted_keys)
 
         if self.batched_msg_sender is not None:
             for key in evicted_keys:
@@ -1023,5 +1036,21 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self._stop_background_evictor()
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
-        self.clear()
+        kv_events = self.kv_events
+        self.kv_events = None
+        try:
+            self.clear()
+        finally:
+            self.kv_events = kv_events
         self.memory_allocator.close()
+
+    def _publish_remove_event(self, keys: Sequence[CacheEngineKey]) -> None:
+        if self.kv_events is None or not keys:
+            return
+        self.kv_events.append(
+            CacheRemoveEvent(
+                block_hashes=[key.chunk_hash for key in keys],
+                medium="cpu",
+                group_idx=None,
+            )
+        )

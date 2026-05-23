@@ -593,6 +593,16 @@ class CacheStoreEvent:
     lora_name: str | None
 
 
+@dataclass
+class CacheRemoveEvent:
+    block_hashes: list[int]
+    medium: str | None
+    group_idx: int | None = None
+
+
+CacheEvent = CacheStoreEvent | CacheRemoveEvent
+
+
 class EngineType(Enum):
     VLLM = "vllm"
     SGLANG = "sglang"

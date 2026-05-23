@@ -14,7 +14,7 @@ import zmq
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, CacheStoreEvent
+from lmcache.utils import CacheEngineKey, CacheEvent, CacheStoreEvent
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -268,7 +268,7 @@ class KvTransferBackend(StorageBackendInterface):
         # KV events — this list is owned by CacheEngine and injected via
         # set_kv_events_sink(); events are appended directly to the engine's
         # list so that consumers only need to poll one place.
-        self.kv_events: Optional[List[CacheStoreEvent]] = None
+        self.kv_events: Optional[List[CacheEvent]] = None
 
         # ===== ZMQ Socket Management for Connection Reuse =====
         # Uses ROUTER/DEALER pattern for concurrent multi-client requests
@@ -1608,7 +1608,7 @@ class KvTransferBackend(StorageBackendInterface):
         logger.warning("Keys not found on any preferred peer")
         return [], ""
     
-    def set_kv_events_sink(self, kv_events: List[CacheStoreEvent]) -> None:
+    def set_kv_events_sink(self, kv_events: List[CacheEvent]) -> None:
         """Inject the CacheEngine's kv_events list so that transfer events
         are appended directly to the engine's queue instead of a local one."""
         self.kv_events = kv_events

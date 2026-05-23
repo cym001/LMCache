@@ -40,6 +40,7 @@ from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
+    CacheEvent,
     CacheStoreEvent,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
@@ -110,9 +111,10 @@ def _kv_event_parent_hash_to_u64(value: Any) -> int | None:
     return _kv_event_hash_to_u64(value)
 
 
-def _normalize_kv_event_hashes(event: CacheStoreEvent) -> CacheStoreEvent:
+def _normalize_kv_event_hashes(event: CacheEvent) -> CacheEvent:
     event.block_hashes = [_kv_event_hash_to_u64(item) for item in event.block_hashes]
-    event.parent_block_hash = _kv_event_parent_hash_to_u64(event.parent_block_hash)
+    if isinstance(event, CacheStoreEvent):
+        event.parent_block_hash = _kv_event_parent_hash_to_u64(event.parent_block_hash)
     return event
 
 
@@ -259,7 +261,7 @@ class LMCacheEngine:
         self.kv_events_enabled = False
         self.kv_events_enabled = config.enable_kv_events
         if self.kv_events_enabled:
-            self.kv_events: List[CacheStoreEvent] = []
+            self.kv_events: List[CacheEvent] = []
             logger.info("KV events are enabled.")
         else:
             logger.info("KV events are disabled.")
@@ -423,6 +425,11 @@ class LMCacheEngine:
                     )
                     if kv_transfer_backend is not None:
                         kv_transfer_backend.set_kv_events_sink(self.kv_events)
+                    local_cpu_backend = self.storage_manager.storage_backends.get(
+                        "LocalCPUBackend"
+                    )
+                    if local_cpu_backend is not None:
+                        local_cpu_backend.set_kv_events_sink(self.kv_events)
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -1948,9 +1955,10 @@ class LMCacheEngine:
         return self._clear(tokens, locations, request_configs)
 
     @_lmcache_nvtx_annotate
-    def get_kv_events(self) -> Iterable[CacheStoreEvent]:
-        if self.kv_events_enabled and (events := self.kv_events):
-            self.kv_events = []
+    def get_kv_events(self) -> Iterable[CacheEvent]:
+        if self.kv_events_enabled and self.kv_events:
+            events = list(self.kv_events)
+            self.kv_events.clear()
             return [_normalize_kv_event_hashes(event) for event in events]
         return []
 
