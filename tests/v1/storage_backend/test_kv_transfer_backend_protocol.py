@@ -127,6 +127,35 @@ async def test_handle_put_rebuilds_local_keys_before_store() -> None:
 
 
 @pytest.mark.anyio
+async def test_handle_put_publishes_per_chunk_kv_events() -> None:
+    backend, worker_id = _make_backend_stub(worker_id=3)
+    backend.kv_events = []
+    backend.local_cpu_backend.contains.return_value = False
+    backend.local_cpu_backend.allocate.side_effect = [MagicMock(), MagicMock()]
+    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
+    backend.transfer_channel.async_batched_read = AsyncMock()
+
+    msg = BatchedLookupAndPutMsg(
+        event_id="evt_put",
+        sender_id="sender_peer",
+        hashes=[5001, 5002],
+        offsets=[16, 16],
+        mem_indexes=[9, 10],
+        token_ids=list(range(101, 117)) + list(range(201, 217)),
+    )
+
+    await backend._handle_kv_transfer_msg(msg)
+
+    assert len(backend.kv_events) == 2
+    assert [event.block_size for event in backend.kv_events] == [16, 16]
+    assert [event.block_hashes for event in backend.kv_events] == [[5001], [5002]]
+    assert backend.kv_events[0].parent_block_hash is None
+    assert backend.kv_events[1].parent_block_hash == 5001
+    assert backend.kv_events[0].token_ids == list(range(101, 117))
+    assert backend.kv_events[1].token_ids == list(range(201, 217))
+
+
+@pytest.mark.anyio
 async def test_handle_put_returns_existing_count_when_all_chunks_exist() -> None:
     backend, _ = _make_backend_stub(worker_id=3)
     backend.local_cpu_backend.contains.return_value = True
