@@ -583,29 +583,14 @@ class KvTransferBackend(StorageBackendInterface):
                     event_id,
                 )
 
-                # Publish one aggregated CacheStoreEvent for this transfer request.
-                # Include all requested blocks (already existing + newly transferred)
-                # so observability can reconstruct full transfer scope.
-                if self.kv_events is not None:
-                    event_token_ids = self._validate_transfer_event_token_ids(
-                        token_ids=token_ids,
-                        offsets=offsets,
-                        event_id=event_id,
-                    )
-                    stored_event = CacheStoreEvent(
-                        block_hashes=[key.chunk_hash for key in keys],
-                        parent_block_hash=None,
-                        token_ids=event_token_ids,
-                        block_size=sum(offsets),
-                        lora_id=None,
-                        medium="cpu",
-                        lora_name=None,
-                    )
-                    logger.debug(
-                        "Added kv transfer aggregate event '%s' to kv cache events queue",
-                        stored_event,
-                    )
-                    self.kv_events.append(stored_event)
+                # Publish one CacheStoreEvent per chunk so downstream KV indexers
+                # (e.g. Dynamo) can register fixed-size blocks.
+                self._publish_transfer_cache_store_events(
+                    keys=keys,
+                    offsets=offsets,
+                    token_ids=token_ids,
+                    event_id=event_id,
+                )
 
                 return BatchedLookupAndPutRetMsg(
                     event_id=event_id,
@@ -661,6 +646,49 @@ class KvTransferBackend(StorageBackendInterface):
             return []
 
         return list(token_ids)
+
+    def _publish_transfer_cache_store_events(
+        self,
+        keys: Sequence[CacheEngineKey],
+        offsets: Sequence[int],
+        token_ids: Optional[list[int]],
+        event_id: str,
+    ) -> None:
+        """Publish one CacheStoreEvent per transferred chunk."""
+        if self.kv_events is None:
+            return
+
+        flat_token_ids = self._validate_transfer_event_token_ids(
+            token_ids=token_ids,
+            offsets=list(offsets),
+            event_id=event_id,
+        )
+
+        cum_chunk_lengths = [0]
+        for offset in offsets:
+            cum_chunk_lengths.append(cum_chunk_lengths[-1] + offset)
+
+        prev_key = None
+        for idx, key in enumerate(keys):
+            num_tokens = offsets[idx]
+            chunk_token_ids = flat_token_ids[
+                cum_chunk_lengths[idx] : cum_chunk_lengths[idx + 1]
+            ]
+            stored_event = CacheStoreEvent(
+                block_hashes=[key.chunk_hash],
+                parent_block_hash=prev_key,
+                token_ids=chunk_token_ids,
+                block_size=num_tokens,
+                lora_id=None,
+                medium="cpu",
+                lora_name=None,
+            )
+            logger.debug(
+                "Added kv cache event '%s' to kv cache events queue",
+                stored_event,
+            )
+            self.kv_events.append(stored_event)
+            prev_key = key.chunk_hash
 
     async def _ensure_peer_connection(
         self,
@@ -1018,7 +1046,8 @@ class KvTransferBackend(StorageBackendInterface):
         Args:
             lookup_id: Unique identifier for this lookup operation
             keys: List of cache keys to retrieve
-            transfer_spec: Transfer specification containing chunk lengths
+            transfer_spec: Transfer specification containing chunk lengths and
+                optional flat token ids for event reporting
             event_id: Optional event ID for request correlation (auto-generated if empty)
             
         Returns:
@@ -1038,6 +1067,7 @@ class KvTransferBackend(StorageBackendInterface):
 
         assert isinstance(transfer_spec, dict)
         cum_chunk_lengths = transfer_spec.get("cum_chunk_lengths", None)
+        token_ids = transfer_spec.get("token_ids")
         assert cum_chunk_lengths is not None, "cum_chunk_lengths must be provided"
 
         # Allocate memory for incoming data
@@ -1109,26 +1139,17 @@ class KvTransferBackend(StorageBackendInterface):
             missed_mem_obj.ref_count_down()
 
         # Publish CacheStoreEvent for each successfully retrieved chunk
-        if self.kv_events is not None:
-            assert cum_chunk_lengths is not None
-            prev_key = None
-            for idx, key in enumerate(keys[:num_hit_chunks]):
-                num_tokens = cum_chunk_lengths[idx + 1] - cum_chunk_lengths[idx]
-                stored_event = CacheStoreEvent(
-                    block_hashes=[key.chunk_hash],
-                    parent_block_hash=prev_key,
-                    token_ids=[],
-                    block_size=num_tokens,
-                    lora_id=None,
-                    medium="cpu",
-                    lora_name=None,
-                )
-                logger.debug(
-                    "Added kv cache event '%s' to kv cache events queue"
-                    % stored_event
-                )
-                self.kv_events.append(stored_event)
-                prev_key = key.chunk_hash
+        if cum_chunk_lengths is not None:
+            offsets = [
+                cum_chunk_lengths[i + 1] - cum_chunk_lengths[i]
+                for i in range(num_hit_chunks)
+            ]
+            self._publish_transfer_cache_store_events(
+                keys=keys[:num_hit_chunks],
+                offsets=offsets,
+                token_ids=token_ids,
+                event_id=event_id,
+            )
 
         return hit_mem_objs
 
