@@ -109,6 +109,9 @@ class BatchedLookupAndPutMsg(KvTransferMsgBase):
     # Optional flat token ids for the full transfer request
     token_ids: list[int] | None = None
 
+    # Optional parent hash for each transferred chunk
+    parent_hashes: list[ChunkHash | None] | None = None
+
 
 class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
     """Batched PUT response message"""
@@ -589,6 +592,7 @@ class KvTransferBackend(StorageBackendInterface):
                     keys=keys,
                     offsets=offsets,
                     token_ids=token_ids,
+                    parent_hashes=msg.parent_hashes,
                     event_id=event_id,
                 )
 
@@ -652,11 +656,22 @@ class KvTransferBackend(StorageBackendInterface):
         keys: Sequence[CacheEngineKey],
         offsets: Sequence[int],
         token_ids: Optional[list[int]],
+        parent_hashes: Optional[Sequence[ChunkHash | None]],
         event_id: str,
     ) -> None:
         """Publish one CacheStoreEvent per transferred chunk."""
         if self.kv_events is None:
             return
+
+        if parent_hashes is not None and len(parent_hashes) != len(keys):
+            logger.warning(
+                "Transfer event parent_hashes length mismatch for event_id=%s: "
+                "got=%d expected=%d. Falling back to in-batch parent chain.",
+                event_id,
+                len(parent_hashes),
+                len(keys),
+            )
+            parent_hashes = None
 
         flat_token_ids = self._validate_transfer_event_token_ids(
             token_ids=token_ids,
@@ -674,9 +689,12 @@ class KvTransferBackend(StorageBackendInterface):
             chunk_token_ids = flat_token_ids[
                 cum_chunk_lengths[idx] : cum_chunk_lengths[idx + 1]
             ]
+            parent_block_hash = (
+                parent_hashes[idx] if parent_hashes is not None else prev_key
+            )
             stored_event = CacheStoreEvent(
                 block_hashes=[key.chunk_hash],
-                parent_block_hash=prev_key,
+                parent_block_hash=parent_block_hash,
                 token_ids=chunk_token_ids,
                 block_size=num_tokens,
                 lora_id=None,
@@ -1068,6 +1086,7 @@ class KvTransferBackend(StorageBackendInterface):
         assert isinstance(transfer_spec, dict)
         cum_chunk_lengths = transfer_spec.get("cum_chunk_lengths", None)
         token_ids = transfer_spec.get("token_ids")
+        parent_hashes = transfer_spec.get("parent_hashes")
         assert cum_chunk_lengths is not None, "cum_chunk_lengths must be provided"
 
         # Allocate memory for incoming data
@@ -1148,6 +1167,11 @@ class KvTransferBackend(StorageBackendInterface):
                 keys=keys[:num_hit_chunks],
                 offsets=offsets,
                 token_ids=token_ids,
+                parent_hashes=(
+                    parent_hashes[:num_hit_chunks]
+                    if parent_hashes is not None
+                    else None
+                ),
                 event_id=event_id,
             )
 
@@ -1162,6 +1186,7 @@ class KvTransferBackend(StorageBackendInterface):
         offsets: Optional[List[int]] = None,
         event_id: str = "",
         token_ids: Optional[List[int]] = None,
+        parent_hashes: Optional[List[ChunkHash | None]] = None,
     ) -> KvTransferPeerResult:
         """
         Transfer KV cache data to a specific peer node.
@@ -1177,6 +1202,7 @@ class KvTransferBackend(StorageBackendInterface):
             offsets: Optional token counts. If None, uses chunk_size.
             event_id: Optional event ID for request correlation (auto-generated if empty)
             token_ids: Optional flat token ids for the full transfer request.
+            parent_hashes: Optional parent hash for each transferred chunk.
         
         Returns:
             Transfer result with newly read, already existing, and requested counts
@@ -1191,6 +1217,7 @@ class KvTransferBackend(StorageBackendInterface):
             "offsets": offsets,
             "event_id": event_id,
             "token_ids": token_ids,
+            "parent_hashes": parent_hashes,
         }
         
         return await self.async_batched_submit_put_task(
@@ -1229,6 +1256,7 @@ class KvTransferBackend(StorageBackendInterface):
         offsets = transfer_spec["offsets"]
         event_id = transfer_spec.get("event_id", "")
         token_ids = transfer_spec.get("token_ids")
+        parent_hashes = transfer_spec.get("parent_hashes")
 
         # Establish connection to target peer (reuses existing connection if available)
         await self._ensure_peer_connection(peer_init_url)
@@ -1246,6 +1274,7 @@ class KvTransferBackend(StorageBackendInterface):
             hashes=list(hashes),
             offsets=offsets,
             token_ids=token_ids,
+            parent_hashes=parent_hashes,
             mem_indexes=local_indexes,
         )
 

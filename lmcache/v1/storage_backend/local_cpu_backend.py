@@ -126,7 +126,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             int(config.get_extra_config_value("local_cpu.evict_batch_candidates", 16)),
         )
         self.background_evict_enabled = self._parse_bool(
-            config.get_extra_config_value("local_cpu.background_evict_enabled", True)
+            config.get_extra_config_value("local_cpu.background_evict_enabled", False)
         )
         self.evict_high_watermark = float(
             config.get_extra_config_value("local_cpu.evict_high_watermark", 0.92)
