@@ -136,6 +136,14 @@ class _KvTransferJob:
     result: Future[int]
 
 
+@dataclass(frozen=True)
+class _KvEventChunkInfo:
+    start: int
+    end: int
+    key: CacheEngineKey
+    parent_block_hash: Any | None
+
+
 def _foreground_operation(method: Callable[..., Any]) -> Callable[..., Any]:
     @wraps(method)
     def wrapper(self: "LMCacheEngine", *args: Any, **kwargs: Any) -> Any:
@@ -275,8 +283,10 @@ class LMCacheEngine:
         self.kv_events_enabled = config.enable_kv_events
         if self.kv_events_enabled:
             self.kv_events: List[CacheEvent] = []
+            self._kv_event_published_hashes: set[Any] = set()
             logger.info("KV events are enabled.")
         else:
+            self._kv_event_published_hashes = set()
             logger.info("KV events are disabled.")
 
         # HACK: remove this in the future
@@ -684,8 +694,31 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        store_event_infos: dict[tuple[int, int, Any], _KvEventChunkInfo] = {}
+        full_event_infos: list[_KvEventChunkInfo] = []
+        if self.kv_events_enabled:
+            masked_event_infos = self._build_kv_event_chunk_infos(
+                tokens=tokens,
+                hashes=hashes,
+                offsets=offsets,
+                mask=mask,
+                request_configs=request_configs,
+            )
+            full_event_infos = (
+                self._build_kv_event_chunk_infos(
+                    tokens=tokens,
+                    mask=None,
+                    request_configs=request_configs,
+                )
+                if tokens is not None
+                else masked_event_infos
+            )
+            store_event_infos = {
+                (info.start, info.end, info.key.chunk_hash): info
+                for info in masked_event_infos
+            }
+
         with store_stats.profile_process_tokens():
-            prev_key: Any | None = None
             for start, end, key in self.token_database.process_tokens(
                 tokens,
                 hashes,
@@ -726,33 +759,16 @@ class LMCacheEngine:
 
                 # Create KV event
                 if self.kv_events_enabled:
-                    stored_event = CacheStoreEvent(
-                        block_hashes=[key.chunk_hash],
-                        parent_block_hash=prev_key,
-                        token_ids=[],
-                        block_size=num_tokens,
-                        lora_id=None,
-                        medium="cpu",
-                        lora_name=None,
+                    event_info = store_event_infos.get(
+                        (start, end, key.chunk_hash),
                     )
-                    if tokens is not None:
-                        stored_event.token_ids = convert_tokens_to_list(
-                            tokens,
-                            start,
-                            end,
+                    if event_info is not None:
+                        self._publish_kv_event_parent_chain(
+                            full_event_infos,
+                            event_info,
+                            tokens=tokens,
                         )
-                        if isinstance(tokens, torch.Tensor):
-                            stored_event.medium = tokens.device
-                    elif hashes is not None:
-                        stored_event.token_ids = hashes[start : end + 1]
-                    logger.debug(
-                        (
-                            "Added kv cache event '%s' to kv cache events queue"
-                            % stored_event
-                        )
-                    )
-                    self.kv_events.append(stored_event)
-                    prev_key = key.chunk_hash
+                        self._append_kv_store_event(event_info, tokens=tokens)
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
@@ -929,6 +945,14 @@ class LMCacheEngine:
                 memory_obj.meta.shape[token_dim] for memory_obj in transfer_objs
             ]
             transfer_hashes = [key.chunk_hash for key in keys]
+            parent_hash_by_hash: dict[Any, Any | None] = {}
+            prev_hash: Any | None = None
+            for chunk_hash in job.hashes:
+                parent_hash_by_hash[chunk_hash] = prev_hash
+                prev_hash = chunk_hash
+            transfer_parent_hashes = [
+                parent_hash_by_hash.get(key.chunk_hash) for key in keys
+            ]
 
             # Step 4: Get KvTransferBackend and perform the transfer
             kv_transfer_backend = self.storage_manager.storage_backends.get(
@@ -952,6 +976,7 @@ class LMCacheEngine:
                         offsets=actual_offsets,
                         event_id=job.event_id,
                         token_ids=job.token_ids,
+                        parent_hashes=transfer_parent_hashes,
                     ),
                     self.storage_manager.loop,
                 )
@@ -1188,8 +1213,8 @@ class LMCacheEngine:
                         start,
                         end,
                     )
-                    if isinstance(tokens, torch.Tensor):
-                        stored_event.medium = tokens.device
+                    # if isinstance(tokens, torch.Tensor):
+                    #     stored_event.medium = tokens.device
                 logger.debug(
                     "Added kv cache event '%s' to kv cache events queue",
                     stored_event,
@@ -1338,6 +1363,19 @@ class LMCacheEngine:
                 # operation, and then process to_cpu operation.
                 if not hasattr(self.gpu_connector, "load_stream"):
                     self.broadcast_stream.synchronize()
+
+        if self.kv_events_enabled and reordered_chunks:
+            event_infos = self._build_kv_event_chunk_infos(
+                tokens=tokens,
+                mask=None,
+                request_configs=kwargs.get("request_configs"),
+            )
+            hit_hashes = {key.chunk_hash for key, _, _, _ in reordered_chunks}
+            self._publish_kv_event_prefix_chain(
+                event_infos,
+                hit_hashes,
+                tokens=tokens,
+            )
 
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
@@ -1697,6 +1735,19 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
+                if self.kv_events_enabled and hit_chunks:
+                    event_infos = self._build_kv_event_chunk_infos(
+                        tokens=tokens,
+                        hashes=hashes,
+                        offsets=offsets,
+                        request_configs=request_configs,
+                    )
+                    hit_hashes = {key.chunk_hash for key in keys[:hit_chunks]}
+                    self._publish_kv_event_prefix_chain(
+                        event_infos,
+                        hit_hashes,
+                        tokens=tokens,
+                    )
                 if pin and block_mapping:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"
@@ -2061,8 +2112,136 @@ class LMCacheEngine:
         if self.kv_events_enabled and self.kv_events:
             events = list(self.kv_events)
             self.kv_events.clear()
+            self._kv_event_published_hashes.clear()
             return [_normalize_kv_event_hashes(event) for event in events]
         return []
+
+    def _build_kv_event_chunk_infos(
+        self,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+        hashes: Optional[List[int]] = None,
+        offsets: Optional[List[int]] = None,
+        mask: Optional[torch.Tensor] = None,
+        request_configs: Optional[dict] = None,
+    ) -> list[_KvEventChunkInfo]:
+        """Build KV event chunk metadata with parent hashes from the full chain."""
+        if tokens is None:
+            assert hashes is not None
+            assert offsets is not None
+            infos: list[_KvEventChunkInfo] = []
+            prev_hash: Any | None = None
+            for start, end, key in self.token_database.process_tokens(
+                hashes=hashes,
+                offsets=offsets,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                infos.append(
+                    _KvEventChunkInfo(
+                        start=start,
+                        end=end,
+                        key=key,
+                        parent_block_hash=prev_hash,
+                    )
+                )
+                prev_hash = key.chunk_hash
+            return infos
+
+        full_hash_infos = list(
+            self.token_database.process_tokens(
+                tokens=tokens,
+                mask=None,
+                make_key=False,
+                request_configs=request_configs,
+            )
+        )
+        parent_by_span: dict[tuple[int, int], Any | None] = {}
+        prev_hash = None
+        for start, end, chunk_hash in full_hash_infos:
+            assert not isinstance(chunk_hash, CacheEngineKey)
+            parent_by_span[(start, end)] = prev_hash
+            prev_hash = chunk_hash
+
+        infos = []
+        for start, end, key in self.token_database.process_tokens(
+            tokens=tokens,
+            mask=mask,
+            request_configs=request_configs,
+        ):
+            assert isinstance(key, CacheEngineKey)
+            infos.append(
+                _KvEventChunkInfo(
+                    start=start,
+                    end=end,
+                    key=key,
+                    parent_block_hash=parent_by_span[(start, end)],
+                )
+            )
+        return infos
+
+    def _append_kv_store_event(
+        self,
+        info: _KvEventChunkInfo,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+    ) -> None:
+        """Append a single CacheStoreEvent unless it is already pending."""
+        if not self.kv_events_enabled:
+            return
+        if info.key.chunk_hash in self._kv_event_published_hashes:
+            return
+
+        token_ids = []
+        if tokens is not None:
+            token_ids = convert_tokens_to_list(tokens, info.start, info.end)
+
+        stored_event = CacheStoreEvent(
+            block_hashes=[info.key.chunk_hash],
+            parent_block_hash=info.parent_block_hash,
+            token_ids=token_ids,
+            block_size=info.end - info.start,
+            lora_id=None,
+            medium="cpu",
+            lora_name=None,
+        )
+        logger.debug(
+            "Added kv cache event '%s' to kv cache events queue",
+            stored_event,
+        )
+        self.kv_events.append(stored_event)
+        self._kv_event_published_hashes.add(info.key.chunk_hash)
+
+    def _publish_kv_event_parent_chain(
+        self,
+        event_infos: list[_KvEventChunkInfo],
+        target_info: _KvEventChunkInfo,
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+    ) -> None:
+        """Publish missing parent events before publishing a child event."""
+        if not self.kv_events_enabled:
+            return
+        assert self.storage_manager is not None
+
+        for info in event_infos:
+            if info.key.chunk_hash == target_info.key.chunk_hash:
+                return
+            if info.key.chunk_hash in self._kv_event_published_hashes:
+                continue
+            if self.storage_manager.contains(info.key, self.retrieve_locations):
+                self._append_kv_store_event(info, tokens=tokens)
+
+    def _publish_kv_event_prefix_chain(
+        self,
+        event_infos: list[_KvEventChunkInfo],
+        hit_hashes: set[Any],
+        tokens: Optional[Union[torch.Tensor, List[int]]] = None,
+    ) -> None:
+        """Publish a contiguous hit prefix in parent-before-child order."""
+        if not self.kv_events_enabled:
+            return
+        for info in event_infos:
+            if info.key.chunk_hash not in hit_hashes:
+                return
+            self._append_kv_store_event(info, tokens=tokens)
 
     def _clear(
         self,
