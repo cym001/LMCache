@@ -14,7 +14,7 @@ import zmq
 
 # First Party
 from lmcache.logging import init_logger
-from lmcache.utils import CacheEngineKey, CacheEvent, CacheStoreEvent
+from lmcache.utils import CacheEngineKey, CacheEvent
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
     MemoryFormat,
@@ -25,6 +25,10 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.kv_event_utils import (
+    build_full_sequence_store_events,
+    validate_full_sequence_token_ids,
+)
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
@@ -51,6 +55,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 ChunkHash: TypeAlias = Union[int, bytes]
+
+# Sentinel mem_index when the sender does not hold KV data for a sequence chunk.
+KV_TRANSFER_MEM_INDEX_UNAVAILABLE = -1
 
 
 class KvTransferMsgBase(msgspec.Struct, tag=True):
@@ -532,6 +539,16 @@ class KvTransferBackend(StorageBackendInterface):
             existing_chunks_count = 0
             try:
                 for idx, key in enumerate(keys):
+                    if r_mem_indexes[idx] == KV_TRANSFER_MEM_INDEX_UNAVAILABLE:
+                        logger.info(
+                            "Key %s has no source data (mem_index unavailable); "
+                            "stopping transfer of remaining chunks because "
+                            "suffix blocks without prefix are unusable",
+                            key,
+                        )
+                        self._remove_stale_suffix_keys(keys[idx:])
+                        break
+
                     if self.local_cpu_backend.contains(key, pin=False):
                         existing_chunks_count += 1
                         logger.debug(f"Key {key} already exists locally, skipping")
@@ -586,13 +603,12 @@ class KvTransferBackend(StorageBackendInterface):
                     event_id,
                 )
 
-                # Publish one CacheStoreEvent per chunk so downstream KV indexers
-                # (e.g. Dynamo) can register fixed-size blocks.
-                self._publish_transfer_cache_store_events(
-                    keys=keys,
-                    offsets=offsets,
+                # Publish full-sequence KV store events when at least one chunk
+                # was newly migrated.
+                self._publish_full_sequence_kv_store_events_if_migrated(
+                    num_read_chunks=len(local_mem_objs),
                     token_ids=token_ids,
-                    parent_hashes=msg.parent_hashes,
+                    offsets=offsets,
                     event_id=event_id,
                 )
 
@@ -628,85 +644,46 @@ class KvTransferBackend(StorageBackendInterface):
         )
         return keys
 
-    def _validate_transfer_event_token_ids(
+    def _remove_stale_suffix_keys(self, keys: Sequence[CacheEngineKey]) -> int:
+        """Remove suffix chunks that remain locally after a source prefix gap."""
+        keys_to_remove = [
+            key
+            for key in keys
+            if self.local_cpu_backend.contains(key, pin=False)
+        ]
+        if not keys_to_remove:
+            return 0
+
+        removed = self.local_cpu_backend.batched_remove(keys_to_remove)
+        logger.info(
+            "Removed %d stale suffix KV chunks after source prefix gap",
+            removed,
+        )
+        return removed
+
+    def _publish_full_sequence_kv_store_events_if_migrated(
         self,
+        num_read_chunks: int,
         token_ids: Optional[list[int]],
         offsets: list[int],
         event_id: str,
-    ) -> list[int]:
-        """Validate flat token ids for transfer event reporting."""
-        if token_ids is None:
-            return []
-
-        expected = sum(offsets)
-        if len(token_ids) != expected:
-            logger.warning(
-                "Transfer event token_ids length mismatch for event_id=%s: "
-                "got=%d expected=%d. Falling back to empty token_ids.",
-                event_id,
-                len(token_ids),
-                expected,
-            )
-            return []
-
-        return list(token_ids)
-
-    def _publish_transfer_cache_store_events(
-        self,
-        keys: Sequence[CacheEngineKey],
-        offsets: Sequence[int],
-        token_ids: Optional[list[int]],
-        parent_hashes: Optional[Sequence[ChunkHash | None]],
-        event_id: str,
     ) -> None:
-        """Publish one CacheStoreEvent per transferred chunk."""
-        if self.kv_events is None:
+        """Publish full-sequence store events after at least one chunk migrated."""
+        if num_read_chunks < 1 or self.kv_events is None or not token_ids:
             return
 
-        if parent_hashes is not None and len(parent_hashes) != len(keys):
-            logger.warning(
-                "Transfer event parent_hashes length mismatch for event_id=%s: "
-                "got=%d expected=%d. Falling back to in-batch parent chain.",
-                event_id,
-                len(parent_hashes),
-                len(keys),
-            )
-            parent_hashes = None
+        if not validate_full_sequence_token_ids(token_ids, offsets, event_id):
+            return
 
-        flat_token_ids = self._validate_transfer_event_token_ids(
-            token_ids=token_ids,
-            offsets=list(offsets),
-            event_id=event_id,
-        )
-
-        cum_chunk_lengths = [0]
-        for offset in offsets:
-            cum_chunk_lengths.append(cum_chunk_lengths[-1] + offset)
-
-        prev_key = None
-        for idx, key in enumerate(keys):
-            num_tokens = offsets[idx]
-            chunk_token_ids = flat_token_ids[
-                cum_chunk_lengths[idx] : cum_chunk_lengths[idx + 1]
-            ]
-            parent_block_hash = (
-                parent_hashes[idx] if parent_hashes is not None else prev_key
-            )
-            stored_event = CacheStoreEvent(
-                block_hashes=[key.chunk_hash],
-                parent_block_hash=parent_block_hash,
-                token_ids=chunk_token_ids,
-                block_size=num_tokens,
-                lora_id=None,
-                medium="cpu",
-                lora_name=None,
-            )
+        for event in build_full_sequence_store_events(
+            self.token_database,
+            token_ids,
+        ):
             logger.debug(
                 "Added kv cache event '%s' to kv cache events queue",
-                stored_event,
+                event,
             )
-            self.kv_events.append(stored_event)
-            prev_key = key.chunk_hash
+            self.kv_events.append(event)
 
     async def _ensure_peer_connection(
         self,
@@ -1157,21 +1134,16 @@ class KvTransferBackend(StorageBackendInterface):
         for missed_mem_obj in mem_objs[num_hit_chunks:]:
             missed_mem_obj.ref_count_down()
 
-        # Publish CacheStoreEvent for each successfully retrieved chunk
-        if cum_chunk_lengths is not None:
-            offsets = [
+        # Publish full-sequence KV store events when at least one chunk retrieved.
+        if token_ids is not None and cum_chunk_lengths is not None:
+            full_offsets = [
                 cum_chunk_lengths[i + 1] - cum_chunk_lengths[i]
-                for i in range(num_hit_chunks)
+                for i in range(len(cum_chunk_lengths) - 1)
             ]
-            self._publish_transfer_cache_store_events(
-                keys=keys[:num_hit_chunks],
-                offsets=offsets,
+            self._publish_full_sequence_kv_store_events_if_migrated(
+                num_read_chunks=num_hit_chunks,
                 token_ids=token_ids,
-                parent_hashes=(
-                    parent_hashes[:num_hit_chunks]
-                    if parent_hashes is not None
-                    else None
-                ),
+                offsets=full_offsets,
                 event_id=event_id,
             )
 
@@ -1187,6 +1159,7 @@ class KvTransferBackend(StorageBackendInterface):
         event_id: str = "",
         token_ids: Optional[List[int]] = None,
         parent_hashes: Optional[List[ChunkHash | None]] = None,
+        mem_indexes: Optional[List[int]] = None,
     ) -> KvTransferPeerResult:
         """
         Transfer KV cache data to a specific peer node.
@@ -1201,8 +1174,10 @@ class KvTransferBackend(StorageBackendInterface):
             objs: List of memory objects containing the KV cache data
             offsets: Optional token counts. If None, uses chunk_size.
             event_id: Optional event ID for request correlation (auto-generated if empty)
-            token_ids: Optional flat token ids for the full transfer request.
-            parent_hashes: Optional parent hash for each transferred chunk.
+            token_ids: Optional flat token ids for the full sequence.
+            parent_hashes: Deprecated; parent hashes are derived from token_ids.
+            mem_indexes: Per-chunk source mem indexes aligned with hashes; use
+                KV_TRANSFER_MEM_INDEX_UNAVAILABLE when source has no data.
         
         Returns:
             Transfer result with newly read, already existing, and requested counts
@@ -1218,6 +1193,7 @@ class KvTransferBackend(StorageBackendInterface):
             "event_id": event_id,
             "token_ids": token_ids,
             "parent_hashes": parent_hashes,
+            "mem_indexes": mem_indexes,
         }
         
         return await self.async_batched_submit_put_task(
@@ -1257,11 +1233,13 @@ class KvTransferBackend(StorageBackendInterface):
         event_id = transfer_spec.get("event_id", "")
         token_ids = transfer_spec.get("token_ids")
         parent_hashes = transfer_spec.get("parent_hashes")
+        mem_indexes = transfer_spec.get("mem_indexes")
 
         # Establish connection to target peer (reuses existing connection if available)
         await self._ensure_peer_connection(peer_init_url)
 
-        local_indexes = self.transfer_channel.get_local_mem_indices(objs)
+        if mem_indexes is None:
+            mem_indexes = self.transfer_channel.get_local_mem_indices(objs)
 
         # Generate event_id if not provided
         if not event_id:
@@ -1275,7 +1253,7 @@ class KvTransferBackend(StorageBackendInterface):
             offsets=offsets,
             token_ids=token_ids,
             parent_hashes=parent_hashes,
-            mem_indexes=local_indexes,
+            mem_indexes=list(mem_indexes),
         )
 
         # Update last used time and move to end (most recently used)

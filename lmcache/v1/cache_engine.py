@@ -913,23 +913,7 @@ class LMCacheEngine:
                 f"peer {job.peer_ip}:{job.peer_init_port}"
             )
 
-            # Step 3: Prepare transfer specification with actual chunk offsets
-            # Extract actual token counts from memory objects
-            token_dim = transfer_objs[0].meta.fmt.token_dim()
-            actual_offsets = [
-                memory_obj.meta.shape[token_dim] for memory_obj in transfer_objs
-            ]
-            transfer_hashes = [key.chunk_hash for key in keys]
-            parent_hash_by_hash: dict[Any, Any | None] = {}
-            prev_hash: Any | None = None
-            for chunk_hash in job.hashes:
-                parent_hash_by_hash[chunk_hash] = prev_hash
-                prev_hash = chunk_hash
-            transfer_parent_hashes = [
-                parent_hash_by_hash.get(key.chunk_hash) for key in keys
-            ]
-
-            # Step 4: Get KvTransferBackend and perform the transfer
+            # Step 3: Get KvTransferBackend and build full-sequence mem_indexes
             kv_transfer_backend = self.storage_manager.storage_backends.get(
                 "KvTransferBackend"
             )
@@ -940,18 +924,40 @@ class LMCacheEngine:
                 )
                 return KV_TRANSFER_FAILED
 
-            # Step 5: Execute the transfer asynchronously
+            hash_to_mem_index: dict[Any, int] = {}
+            local_indexes = kv_transfer_backend.transfer_channel.get_local_mem_indices(
+                transfer_objs
+            )
+            for key, mem_index in zip(keys, local_indexes, strict=False):
+                hash_to_mem_index[key.chunk_hash] = mem_index
+
+            from lmcache.v1.storage_backend.kv_transfer_backend import (
+                KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+            )
+
+            full_mem_indexes: list[int] = []
+            source_prefix_broken = False
+            for chunk_hash in job.hashes:
+                if source_prefix_broken:
+                    full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
+                elif chunk_hash in hash_to_mem_index:
+                    full_mem_indexes.append(hash_to_mem_index[chunk_hash])
+                else:
+                    full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
+                    source_prefix_broken = True
+
+            # Step 4: Execute the transfer asynchronously
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     kv_transfer_backend.transfer_to_peer(
                         peer_ip=job.peer_ip,
                         peer_init_port=job.peer_init_port,
-                        hashes=transfer_hashes,
+                        hashes=job.hashes,
                         objs=transfer_objs,
-                        offsets=actual_offsets,
+                        offsets=job.offsets,
                         event_id=job.event_id,
                         token_ids=job.token_ids,
-                        parent_hashes=transfer_parent_hashes,
+                        mem_indexes=full_mem_indexes,
                     ),
                     self.storage_manager.loop,
                 )
@@ -960,12 +966,12 @@ class LMCacheEngine:
                 num_satisfied = transfer_result.num_satisfied_chunks
                 transfer_status = num_tokens
 
-                if num_satisfied != len(keys):
+                if num_satisfied != len(job.hashes):
                     logger.warning(
                         "Only %d/%d chunks were satisfied by peer "
                         "(%d newly read, %d already existed)",
                         num_satisfied,
-                        len(keys),
+                        len(job.hashes),
                         transfer_result.num_read_chunks,
                         transfer_result.num_existing_chunks,
                     )
