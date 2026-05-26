@@ -170,15 +170,19 @@ Requirements:
 
 Behavior on the receiver:
 
-- Chunks that already exist locally skip data transfer but are still included
-  in the published event sequence when at least one new chunk is migrated
+- Chunks that already exist locally skip data transfer and are **not** republished
+  as KV store events
 - If the source node does not hold a chunk in the prefix sequence, transfer
   stops immediately and all subsequent chunks are skipped (suffix blocks
   without their prefix are not migrated). Any subsequent chunks that still
   exist in the local CPU backend are removed.
 - If **at least one** chunk is newly migrated (``num_read_chunks >= 1``), the
-  receiver publishes a **full-sequence** ``BlockStored`` event chain with
-  correct ``parent_block_hash`` values derived from the complete ``tokens``
+  receiver publishes ``BlockStored`` events **only for newly migrated chunks**,
+  with ``parent_block_hash`` derived from the complete ``tokens`` sequence
+- When the first migrated chunk is not the sequence root, its
+  ``parent_block_hash`` points to the preceding chunk hash; preceding chunks
+  are guaranteed to exist locally by the transfer protocol
+- Each published event must include non-empty ``token_ids``
 - If all chunks already exist on the receiver (``num_read_chunks == 0``), no
   events are published
 

@@ -138,7 +138,7 @@ async def test_handle_put_rebuilds_local_keys_before_store() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_put_publishes_full_sequence_kv_events() -> None:
+async def test_handle_put_publishes_migrated_kv_events() -> None:
     backend, _ = _make_backend_stub(worker_id=3)
     backend.kv_events = []
     backend.local_cpu_backend.contains.return_value = False
@@ -203,7 +203,7 @@ async def test_handle_put_no_events_when_all_chunks_exist() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_put_publishes_full_sequence_when_partial_exist() -> None:
+async def test_handle_put_publishes_only_migrated_chunk_when_partial_exist() -> None:
     backend, worker_id = _make_backend_stub(worker_id=3)
     backend.kv_events = []
     tokens = list(range(48))
@@ -228,10 +228,10 @@ async def test_handle_put_publishes_full_sequence_when_partial_exist() -> None:
 
     assert ret.num_read_chunks == 1
     assert ret.num_existing_chunks == 2
-    assert len(backend.kv_events) == len(expected_events)
-    assert [event.block_hashes for event in backend.kv_events] == [
-        event.block_hashes for event in expected_events
-    ]
+    assert len(backend.kv_events) == 1
+    assert backend.kv_events[0].block_hashes == expected_events[1].block_hashes
+    assert backend.kv_events[0].parent_block_hash == expected_events[0].block_hashes[0]
+    assert backend.kv_events[0].token_ids == expected_events[1].token_ids
     called_keys = backend.local_cpu_backend.batched_submit_put_task.call_args.kwargs[
         "keys"
     ]
@@ -315,7 +315,9 @@ async def test_handle_put_stops_after_source_prefix_gap() -> None:
     backend.local_cpu_backend.batched_remove.assert_called_once()
     removed_keys = backend.local_cpu_backend.batched_remove.call_args.args[0]
     assert [key.chunk_hash for key in removed_keys] == [hashes[2]]
-    assert len(backend.kv_events) == len(expected_events)
+    assert len(backend.kv_events) == 1
+    assert backend.kv_events[0].block_hashes == expected_events[0].block_hashes
+    assert backend.kv_events[0].parent_block_hash is None
 
 
 @pytest.mark.anyio
