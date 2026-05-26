@@ -15,7 +15,10 @@ from lmcache.v1.kv_transfer_status import (
     KV_TRANSFER_ALREADY_SATISFIED,
     KV_TRANSFER_FAILED,
 )
-from lmcache.v1.storage_backend.kv_transfer_backend import KvTransferPeerResult
+from lmcache.v1.storage_backend.kv_transfer_backend import (
+    KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+    KvTransferPeerResult,
+)
 
 
 def _make_transfer_job(result: Future[int] | None = None) -> _KvTransferJob:
@@ -53,9 +56,9 @@ def _make_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[LMCacheEngine, MagicM
     storage_manager.loop = object()
     storage_manager.batched_get.return_value = [memory_obj]
     storage_manager.storage_backends = {"KvTransferBackend": MagicMock()}
-    storage_manager.storage_backends[
-        "KvTransferBackend"
-    ].transfer_to_peer = MagicMock(return_value=object())
+    kv_backend = storage_manager.storage_backends["KvTransferBackend"]
+    kv_backend.transfer_channel.get_local_mem_indices.return_value = [7]
+    kv_backend.transfer_to_peer = MagicMock(return_value=object())
     engine.storage_manager = storage_manager
     engine.lookup_pins = {"evt": {"LocalCPUBackend": [key]}}
     engine.lookup = MagicMock(return_value=16)
@@ -266,3 +269,57 @@ def test_kv_transfer_queue_applies_backpressure() -> None:
 
     worker.join(timeout=1.0)
     assert result_holder["result"] == 123
+
+
+def test_execute_kv_transfer_passes_full_sequence_put_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    key = MagicMock()
+    key.chunk_hash = 101
+    memory_obj = _make_memory_obj()
+    storage_manager = MagicMock()
+    storage_manager.loop = object()
+    storage_manager.batched_get.return_value = [memory_obj]
+    kv_backend = MagicMock()
+    kv_backend.transfer_channel.get_local_mem_indices.return_value = [7]
+    storage_manager.storage_backends = {"KvTransferBackend": kv_backend}
+    engine.storage_manager = storage_manager
+    engine.lookup_pins = {"evt": {"LocalCPUBackend": [key]}}
+    engine.lookup = MagicMock(return_value=16)
+    engine.lookup_unpin = MagicMock()
+
+    transfer_future: Future[KvTransferPeerResult] = Future()
+    transfer_future.set_result(
+        KvTransferPeerResult(
+            num_read_chunks=1,
+            num_existing_chunks=0,
+            num_requested_chunks=2,
+        )
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.cache_engine.asyncio.run_coroutine_threadsafe",
+        MagicMock(return_value=transfer_future),
+    )
+
+    job = _KvTransferJob(
+        hashes=[101, 202],
+        offsets=[16, 16],
+        old_position="LocalCPUBackend",
+        peer_ip="127.0.0.1",
+        peer_init_port=5555,
+        event_id="evt",
+        do_copy=True,
+        token_ids=list(range(32)),
+        result=Future(),
+    )
+
+    assert engine._execute_kv_transfer_job(job) == 16
+
+    kwargs = kv_backend.transfer_to_peer.call_args.kwargs
+    assert kwargs["hashes"] == [101, 202]
+    assert kwargs["offsets"] == [16, 16]
+    assert kwargs["token_ids"] == list(range(32))
+    assert kwargs["mem_indexes"] == [7, KV_TRANSFER_MEM_INDEX_UNAVAILABLE]
+    memory_obj.ref_count_down.assert_called_once()
+    engine.lookup_unpin.assert_called_once_with("evt")

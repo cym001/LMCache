@@ -9,14 +9,25 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.kv_event_utils import build_full_sequence_store_events
 from lmcache.v1.memory_management import MemoryFormat
 from lmcache.v1.storage_backend.kv_transfer_backend import (
     BatchedLookupAndGetMsg,
     BatchedLookupAndPutMsg,
+    KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
     KvTransferBackend,
 )
 from lmcache.v1.token_database import ChunkedTokenDatabase
 from tests.v1.utils import create_test_config, create_test_metadata
+
+
+def _full_sequence_metadata(
+    backend: KvTransferBackend, tokens: list[int]
+) -> tuple[list[int], list[int], list]:
+    events = build_full_sequence_store_events(backend.token_database, tokens)
+    hashes = [event.block_hashes[0] for event in events]
+    offsets = [event.block_size for event in events]
+    return hashes, offsets, events
 
 
 def _make_backend_stub(worker_id: int) -> tuple[KvTransferBackend, int]:
@@ -127,36 +138,7 @@ async def test_handle_put_rebuilds_local_keys_before_store() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_put_publishes_per_chunk_kv_events() -> None:
-    backend, worker_id = _make_backend_stub(worker_id=3)
-    backend.kv_events = []
-    backend.local_cpu_backend.contains.return_value = False
-    backend.local_cpu_backend.allocate.side_effect = [MagicMock(), MagicMock()]
-    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
-    backend.transfer_channel.async_batched_read = AsyncMock()
-
-    msg = BatchedLookupAndPutMsg(
-        event_id="evt_put",
-        sender_id="sender_peer",
-        hashes=[5001, 5002],
-        offsets=[16, 16],
-        mem_indexes=[9, 10],
-        token_ids=list(range(101, 117)) + list(range(201, 217)),
-    )
-
-    await backend._handle_kv_transfer_msg(msg)
-
-    assert len(backend.kv_events) == 2
-    assert [event.block_size for event in backend.kv_events] == [16, 16]
-    assert [event.block_hashes for event in backend.kv_events] == [[5001], [5002]]
-    assert backend.kv_events[0].parent_block_hash is None
-    assert backend.kv_events[1].parent_block_hash == 5001
-    assert backend.kv_events[0].token_ids == list(range(101, 117))
-    assert backend.kv_events[1].token_ids == list(range(201, 217))
-
-
-@pytest.mark.anyio
-async def test_handle_put_uses_explicit_parent_hashes_for_kv_events() -> None:
+async def test_handle_put_publishes_full_sequence_kv_events() -> None:
     backend, _ = _make_backend_stub(worker_id=3)
     backend.kv_events = []
     backend.local_cpu_backend.contains.return_value = False
@@ -164,20 +146,176 @@ async def test_handle_put_uses_explicit_parent_hashes_for_kv_events() -> None:
     backend.local_cpu_backend.batched_submit_put_task = MagicMock()
     backend.transfer_channel.async_batched_read = AsyncMock()
 
+    tokens = list(range(32))
+    hashes, offsets, expected_events = _full_sequence_metadata(backend, tokens)
+
     msg = BatchedLookupAndPutMsg(
-        event_id="evt_put_suffix",
+        event_id="evt_put",
         sender_id="sender_peer",
-        hashes=[5001, 5002],
-        offsets=[16, 16],
+        hashes=hashes,
+        offsets=offsets,
         mem_indexes=[9, 10],
-        parent_hashes=[4000, 5001],
+        token_ids=tokens,
     )
 
     await backend._handle_kv_transfer_msg(msg)
 
-    assert len(backend.kv_events) == 2
-    assert [event.block_hashes for event in backend.kv_events] == [[5001], [5002]]
-    assert [event.parent_block_hash for event in backend.kv_events] == [4000, 5001]
+    assert len(backend.kv_events) == len(expected_events)
+    assert [event.block_size for event in backend.kv_events] == [
+        event.block_size for event in expected_events
+    ]
+    assert [event.block_hashes for event in backend.kv_events] == [
+        event.block_hashes for event in expected_events
+    ]
+    assert [event.parent_block_hash for event in backend.kv_events] == [
+        event.parent_block_hash for event in expected_events
+    ]
+    assert [event.token_ids for event in backend.kv_events] == [
+        event.token_ids for event in expected_events
+    ]
+
+
+@pytest.mark.anyio
+async def test_handle_put_no_events_when_all_chunks_exist() -> None:
+    backend, _ = _make_backend_stub(worker_id=3)
+    backend.kv_events = []
+    backend.local_cpu_backend.contains.return_value = True
+    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
+    backend.transfer_channel.async_batched_read = AsyncMock()
+
+    tokens = list(range(32))
+    hashes, offsets, _ = _full_sequence_metadata(backend, tokens)
+
+    msg = BatchedLookupAndPutMsg(
+        event_id="evt_existing",
+        sender_id="sender_peer",
+        hashes=hashes,
+        offsets=offsets,
+        mem_indexes=[9, 10],
+        token_ids=tokens,
+    )
+
+    ret = await backend._handle_kv_transfer_msg(msg)
+
+    assert ret.num_read_chunks == 0
+    assert ret.num_existing_chunks == 2
+    assert backend.kv_events == []
+
+
+@pytest.mark.anyio
+async def test_handle_put_publishes_full_sequence_when_partial_exist() -> None:
+    backend, worker_id = _make_backend_stub(worker_id=3)
+    backend.kv_events = []
+    tokens = list(range(48))
+    hashes, offsets, expected_events = _full_sequence_metadata(backend, tokens)
+    new_mem_obj = MagicMock()
+
+    backend.local_cpu_backend.contains.side_effect = [True, False, True]
+    backend.local_cpu_backend.allocate.return_value = new_mem_obj
+    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
+    backend.transfer_channel.async_batched_read = AsyncMock()
+
+    msg = BatchedLookupAndPutMsg(
+        event_id="evt_mixed",
+        sender_id="sender_peer",
+        hashes=hashes,
+        offsets=offsets,
+        mem_indexes=[9, 10, 11],
+        token_ids=tokens,
+    )
+
+    ret = await backend._handle_kv_transfer_msg(msg)
+
+    assert ret.num_read_chunks == 1
+    assert ret.num_existing_chunks == 2
+    assert len(backend.kv_events) == len(expected_events)
+    assert [event.block_hashes for event in backend.kv_events] == [
+        event.block_hashes for event in expected_events
+    ]
+    called_keys = backend.local_cpu_backend.batched_submit_put_task.call_args.kwargs[
+        "keys"
+    ]
+    assert len(called_keys) == 1
+    assert called_keys[0].chunk_hash == hashes[1]
+    assert called_keys[0].worker_id == worker_id
+
+
+@pytest.mark.anyio
+async def test_handle_put_stops_when_root_source_chunk_missing() -> None:
+    backend, _ = _make_backend_stub(worker_id=3)
+    backend.kv_events = []
+    tokens = list(range(48))
+    hashes, offsets, _ = _full_sequence_metadata(backend, tokens)
+
+    backend.local_cpu_backend.contains.side_effect = (
+        lambda key, pin=False: key.chunk_hash == hashes[2]
+    )
+    backend.local_cpu_backend.batched_remove = MagicMock(return_value=1)
+    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
+    backend.transfer_channel.async_batched_read = AsyncMock()
+
+    msg = BatchedLookupAndPutMsg(
+        event_id="evt_sparse",
+        sender_id="sender_peer",
+        hashes=hashes,
+        offsets=offsets,
+        mem_indexes=[
+            KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+            KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+            KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+        ],
+        token_ids=tokens,
+    )
+
+    ret = await backend._handle_kv_transfer_msg(msg)
+
+    assert ret.num_read_chunks == 0
+    backend.local_cpu_backend.allocate.assert_not_called()
+    backend.transfer_channel.async_batched_read.assert_not_called()
+    backend.local_cpu_backend.batched_remove.assert_called_once()
+    removed_keys = backend.local_cpu_backend.batched_remove.call_args.args[0]
+    assert [key.chunk_hash for key in removed_keys] == [hashes[2]]
+    assert backend.kv_events == []
+
+
+@pytest.mark.anyio
+async def test_handle_put_stops_after_source_prefix_gap() -> None:
+    backend, worker_id = _make_backend_stub(worker_id=3)
+    backend.kv_events = []
+    tokens = list(range(48))
+    hashes, offsets, expected_events = _full_sequence_metadata(backend, tokens)
+    new_mem_obj = MagicMock()
+
+    backend.local_cpu_backend.contains.side_effect = (
+        lambda key, pin=False: key.chunk_hash == hashes[2]
+    )
+    backend.local_cpu_backend.allocate.return_value = new_mem_obj
+    backend.local_cpu_backend.batched_remove = MagicMock(return_value=1)
+    backend.local_cpu_backend.batched_submit_put_task = MagicMock()
+    backend.transfer_channel.async_batched_read = AsyncMock()
+
+    msg = BatchedLookupAndPutMsg(
+        event_id="evt_prefix_gap",
+        sender_id="sender_peer",
+        hashes=hashes,
+        offsets=offsets,
+        mem_indexes=[10, KV_TRANSFER_MEM_INDEX_UNAVAILABLE, 11],
+        token_ids=tokens,
+    )
+
+    ret = await backend._handle_kv_transfer_msg(msg)
+
+    assert ret.num_read_chunks == 1
+    called_keys = backend.local_cpu_backend.batched_submit_put_task.call_args.kwargs[
+        "keys"
+    ]
+    assert len(called_keys) == 1
+    assert called_keys[0].chunk_hash == hashes[0]
+    assert called_keys[0].worker_id == worker_id
+    backend.local_cpu_backend.batched_remove.assert_called_once()
+    removed_keys = backend.local_cpu_backend.batched_remove.call_args.args[0]
+    assert [key.chunk_hash for key in removed_keys] == [hashes[2]]
+    assert len(backend.kv_events) == len(expected_events)
 
 
 @pytest.mark.anyio

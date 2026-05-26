@@ -157,4 +157,36 @@ How to Generate KV Cache events
             - BlockStored(block_hashes=[8695562889830890067], parent_block_hash=-2282733302929094006, token_ids=[4396, 382, 7039, 11, 279, 1196, 6801, 311, 1414], block_size=8, lora_id=None)
             - BlockStored(block_hashes=[-6034740625096789744], parent_block_hash=8695562889830890067, token_ids=[1414, 911, 279, 15817, 16182, 315, 27950, 323, 20980], block_size=8, lora_id=None)
 
-      This is the event generated after the cache store operation. 
+      This is the event generated after the cache store operation.
+
+KV Transfer Events
+------------------
+
+When KV cache is migrated between nodes through the GlobalKV ``TransferKv`` gRPC
+API and ``KvTransferBackend``, LMCache can publish KV store events on the
+**receiver** after a successful transfer.
+
+Requirements:
+
+- ``enable_kv_events: true`` in the LMCache configuration
+- ``TransferKvRequest`` must include the **full sequence** from the root KV
+  block: ``hash``, ``offset``, and ``tokens`` describe every chunk in order
+- ``len(tokens)`` must equal ``sum(offset)``
+
+Behavior on the receiver:
+
+- Chunks that already exist locally skip data transfer but are still included
+  in the published event sequence when at least one new chunk is migrated
+- If the source node does not hold a chunk in the prefix sequence, transfer
+  stops immediately and all subsequent chunks are skipped (suffix blocks
+  without their prefix are not migrated). Any subsequent chunks that still
+  exist in the local CPU backend are removed.
+- If **at least one** chunk is newly migrated (``num_read_chunks >= 1``), the
+  receiver publishes a **full-sequence** ``BlockStored`` event chain with
+  correct ``parent_block_hash`` values derived from the complete ``tokens``
+- If all chunks already exist on the receiver (``num_read_chunks == 0``), no
+  events are published
+
+For KV-aware routers such as Dynamo, set ``chunk_size`` to match the vLLM
+``block_size`` and configure CPU-tier event routing as required by your
+deployment.
