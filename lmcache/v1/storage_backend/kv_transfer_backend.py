@@ -26,7 +26,7 @@ from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.kv_event_utils import (
-    build_full_sequence_store_events,
+    build_migrated_store_events,
     validate_full_sequence_token_ids,
 )
 from lmcache.v1.token_database import (
@@ -534,6 +534,7 @@ class KvTransferBackend(StorageBackendInterface):
             # Filter out keys that already exist locally
             r_mem_indexes_to_read = []
             keys_to_read = []
+            pre_existing_keys: list[CacheEngineKey] = []
             offsets_to_read = []
             local_mem_objs = []
             existing_chunks_count = 0
@@ -550,6 +551,7 @@ class KvTransferBackend(StorageBackendInterface):
                         break
 
                     if self.local_cpu_backend.contains(key, pin=False):
+                        pre_existing_keys.append(key)
                         existing_chunks_count += 1
                         logger.debug(f"Key {key} already exists locally, skipping")
                         continue
@@ -603,10 +605,10 @@ class KvTransferBackend(StorageBackendInterface):
                     event_id,
                 )
 
-                # Publish full-sequence KV store events when at least one chunk
-                # was newly migrated.
-                self._publish_full_sequence_kv_store_events_if_migrated(
-                    num_read_chunks=len(local_mem_objs),
+                # Publish KV store events only for newly migrated chunks.
+                self._publish_migrated_kv_store_events(
+                    migrated_keys=keys_to_read,
+                    pre_existing_keys=pre_existing_keys,
                     token_ids=token_ids,
                     offsets=offsets,
                     event_id=event_id,
@@ -661,23 +663,27 @@ class KvTransferBackend(StorageBackendInterface):
         )
         return removed
 
-    def _publish_full_sequence_kv_store_events_if_migrated(
+    def _publish_migrated_kv_store_events(
         self,
-        num_read_chunks: int,
+        migrated_keys: list[CacheEngineKey],
+        pre_existing_keys: list[CacheEngineKey],
         token_ids: Optional[list[int]],
         offsets: list[int],
         event_id: str,
     ) -> None:
-        """Publish full-sequence store events after at least one chunk migrated."""
-        if num_read_chunks < 1 or self.kv_events is None or not token_ids:
+        """Publish store events only for newly migrated chunks."""
+        if not migrated_keys or self.kv_events is None or not token_ids:
             return
 
         if not validate_full_sequence_token_ids(token_ids, offsets, event_id):
             return
 
-        for event in build_full_sequence_store_events(
+        pre_existing_hashes = {key.chunk_hash for key in pre_existing_keys}
+        for event in build_migrated_store_events(
             self.token_database,
             token_ids,
+            migrated_keys,
+            pre_existing_hashes,
         ):
             logger.debug(
                 "Added kv cache event '%s' to kv cache events queue",
@@ -1134,14 +1140,15 @@ class KvTransferBackend(StorageBackendInterface):
         for missed_mem_obj in mem_objs[num_hit_chunks:]:
             missed_mem_obj.ref_count_down()
 
-        # Publish full-sequence KV store events when at least one chunk retrieved.
+        # Publish KV store events only for prefix-hit chunks retrieved.
         if token_ids is not None and cum_chunk_lengths is not None:
             full_offsets = [
                 cum_chunk_lengths[i + 1] - cum_chunk_lengths[i]
                 for i in range(len(cum_chunk_lengths) - 1)
             ]
-            self._publish_full_sequence_kv_store_events_if_migrated(
-                num_read_chunks=num_hit_chunks,
+            self._publish_migrated_kv_store_events(
+                migrated_keys=keys[:num_hit_chunks],
+                pre_existing_keys=[],
                 token_ids=token_ids,
                 offsets=full_offsets,
                 event_id=event_id,

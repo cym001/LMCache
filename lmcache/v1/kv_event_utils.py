@@ -2,6 +2,7 @@
 """Utilities for building KV cache store events from token sequences."""
 
 # Standard
+from collections.abc import Sequence
 from typing import Any, Optional
 
 # First Party
@@ -65,6 +66,65 @@ def build_full_sequence_store_events(
                 lora_name=None,
             )
         )
+    return events
+
+
+def build_migrated_store_events(
+    token_database: TokenDatabase,
+    token_ids: list[int],
+    migrated_keys: Sequence[CacheEngineKey],
+    pre_existing_hashes: set[Any],
+    request_configs: Optional[dict] = None,
+) -> list[CacheStoreEvent]:
+    """Build store events only for newly migrated chunks with valid parent chain."""
+    if not migrated_keys:
+        return []
+
+    migrated_hashes = {key.chunk_hash for key in migrated_keys}
+    available_hashes = set(pre_existing_hashes)
+    events: list[CacheStoreEvent] = []
+
+    for start, end, key, parent in build_full_sequence_chunk_infos(
+        token_database,
+        token_ids,
+        request_configs=request_configs,
+    ):
+        if key.chunk_hash not in migrated_hashes:
+            continue
+
+        chunk_tokens = token_ids[start:end]
+        if not chunk_tokens:
+            logger.warning(
+                "Skipping migrated KV store event for empty token_ids slice "
+                "at span [%d, %d) for chunk_hash=%s",
+                start,
+                end,
+                key.chunk_hash,
+            )
+            continue
+
+        if parent is not None and parent not in available_hashes:
+            logger.warning(
+                "Skipping migrated KV store event and remaining chunks: "
+                "parent_block_hash=%s not available for chunk_hash=%s",
+                parent,
+                key.chunk_hash,
+            )
+            break
+
+        events.append(
+            CacheStoreEvent(
+                block_hashes=[key.chunk_hash],
+                parent_block_hash=parent,
+                token_ids=list(chunk_tokens),
+                block_size=end - start,
+                lora_id=None,
+                medium="cpu",
+                lora_name=None,
+            )
+        )
+        available_hashes.add(key.chunk_hash)
+
     return events
 
 
