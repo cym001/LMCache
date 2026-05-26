@@ -1741,7 +1741,7 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
-                if self.kv_events_enabled and hit_chunks:
+                if self.kv_events_enabled and hit_chunks and tokens is not None:
                     event_infos = self._build_kv_event_chunk_infos(
                         tokens=tokens,
                         hashes=hashes,

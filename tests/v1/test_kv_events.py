@@ -94,3 +94,30 @@ def test_lookup_republishes_hit_prefix_events_after_events_are_drained() -> None
         full_infos[0].key.chunk_hash,
         full_infos[1].key.chunk_hash,
     ]
+
+
+def test_lookup_with_hashes_only_skips_prefix_kv_events() -> None:
+    engine = _make_event_engine()
+    tokens = list(range(12))
+    hashes = []
+    offsets = []
+    for start, end, key in engine.token_database.process_tokens(
+        tokens,
+        make_key=False,
+    ):
+        hashes.append(key)
+        offsets.append(end - start)
+
+    keys = [
+        info.key
+        for info in engine._build_kv_event_chunk_infos(
+            tokens=tokens,
+        )
+    ]
+    engine.storage_manager.batched_contains.return_value = (
+        2,
+        {"LocalCPUBackend": keys[:2]},
+    )
+
+    assert engine.lookup(hashes=hashes, offsets=offsets) == 8
+    assert engine.kv_events == []
