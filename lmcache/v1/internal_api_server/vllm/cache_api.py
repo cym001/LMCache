@@ -361,7 +361,9 @@ async def clear(
 
         assert lmcache_engine is not None
         num_removed = lmcache_engine.clear(  # type: ignore[attr-defined]
-            locations=locations, request_configs=request_configs
+            locations=locations,
+            request_configs=request_configs,
+            force=True,
         )
         success_info = {
             "status": "success",
