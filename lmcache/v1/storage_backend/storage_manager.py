@@ -1122,6 +1122,7 @@ class StorageManager:
     def clear(
         self,
         locations: Optional[List[str]] = None,
+        force: bool = False,
     ) -> int:
         """
         Clear all caches in the specified locations.
@@ -1130,6 +1131,8 @@ class StorageManager:
         to perform `clear` in.
         Should be a subset of ["LocalCPUBackend", "LocalDiskBackend"] for now.
         If None, perform `clear` in all backends.
+        :param bool force: If True, clear pinned objects in backends that
+        support force clear (e.g. LocalCPUBackend).
 
         return: Total number of cleared tokens in the specified
         storage backends.
@@ -1140,7 +1143,10 @@ class StorageManager:
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
-                    num_cleared_tokens += backend.clear()
+                    if backend_name == "LocalCPUBackend":
+                        num_cleared_tokens += backend.clear(force=force)
+                    else:
+                        num_cleared_tokens += backend.clear()
                 else:
                     logger.warning(
                         "Storage backend %s does not support "

@@ -2103,15 +2103,18 @@ class LMCacheEngine:
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
         request_configs: Optional[dict] = None,
+        force: bool = False,
     ) -> int:
         # TODO: need to clear by request_configs
         if self.save_only_first_rank:
             if self.metadata.is_first_rank():
-                num_removed = self._clear(tokens, locations, request_configs)
+                num_removed = self._clear(
+                    tokens, locations, request_configs, force=force
+                )
                 return num_removed
             else:
                 return 0
-        return self._clear(tokens, locations, request_configs)
+        return self._clear(tokens, locations, request_configs, force=force)
 
     @_lmcache_nvtx_annotate
     def get_kv_events(self) -> Iterable[CacheEvent]:
@@ -2254,12 +2257,13 @@ class LMCacheEngine:
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
         locations: Optional[List[str]] = None,
         request_configs: Optional[dict] = None,
+        force: bool = False,
     ) -> int:
         assert self.storage_manager is not None
         assert isinstance(self.storage_manager, StorageManager)
         # Clear all caches if tokens is None
         if tokens is None or len(tokens) == 0:
-            num_cleared = self.storage_manager.clear(locations)
+            num_cleared = self.storage_manager.clear(locations, force=force)
             return num_cleared
 
         num_removed = 0

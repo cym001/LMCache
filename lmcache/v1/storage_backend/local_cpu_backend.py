@@ -1174,9 +1174,16 @@ class LocalCPUBackend(AllocatorBackendInterface):
         with self.cpu_lock:
             return list(self.hot_cache.keys())
 
-    def clear(self) -> int:
-        """
-        counts the number of memory objects removed
+    def clear(self, force: bool = False) -> int:
+        """Clear cached memory objects from hot_cache.
+
+        Args:
+            force: If True, clear ALL objects including pinned ones.
+                This may corrupt in-flight lookup operations.
+                If False (default), only clear evictable objects.
+
+        Returns:
+            Number of tokens cleared.
         """
         if not self.use_hot:
             return 0
@@ -1185,14 +1192,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
         with self.cpu_lock:
             for key in self.hot_cache:
                 memory_obj = self.hot_cache[key]
-                if not memory_obj.can_evict:
+                if not force and not memory_obj.can_evict:
                     continue
                 clear_keys.append(key)
                 num_cleared_tokens += memory_obj.get_num_tokens()
 
         # TODO(Jiayi): might not be accurate if we don't calculate
         # `num_cleared_token` and remove the keys in an atomic way.
-        self.batched_remove(clear_keys)
+        self.batched_remove(clear_keys, force=force)
 
         return num_cleared_tokens
 

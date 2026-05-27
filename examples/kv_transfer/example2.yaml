@@ -17,7 +17,7 @@ kv_transfer_host: "127.0.0.1"
 kv_transfer_http_port: 8011
 kv_transfer_init_port: 8207
 kv_transfer_rpc_port: 8208
-kv_transfer_model_name: "DeepSeek-R1-Distill-Qwen-14B"
+kv_transfer_model_name: "Qwen3-30B-A3B-Instruct-2507"
 transfer_channel: "nixl"
 
 # Controller configurations
@@ -29,6 +29,11 @@ transfer_channel: "nixl"
 
 enable_globalkv_server: true
 globalkv_server_max_workers: 2
+
+# Internal API server configurations
+internal_api_server_enabled: True
+internal_api_server_port_start: 7000  # worker 0 -> port 7001
+internal_api_server_include_index_list: [1]
 
 extra_config:
   lookup_backoff_time: 0.001
