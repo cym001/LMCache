@@ -549,7 +549,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 align_cpu_size_bytes,
                 shapes=shapes,
                 dtypes=dtypes,
-                fmt=MemoryFormat.KV_2LTD,  # TODO: remove this hardcode
+                fmt=(
+                    MemoryFormat.KV_MLA_FMT
+                    if metadata is not None and metadata.use_mla
+                    else MemoryFormat.KV_2LTD
+                ),
                 numa_mapping=numa_mapping,
             )
             return paged_mem_allocator

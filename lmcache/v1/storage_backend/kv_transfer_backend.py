@@ -254,8 +254,9 @@ class KvTransferBackend(StorageBackendInterface):
             self.full_size_shape = list(cpu_allocator.shapes[0])
         else:
             self.full_size_shape = list(metadata.get_shapes()[0])
-        # TODO(Jiayi): remove this hardcode
-        self.fmt: MemoryFormat = MemoryFormat.KV_2LTD
+        self.fmt: MemoryFormat = (
+            MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
+        )
         self.chunk_size = config.chunk_size
 
         # Transfer channel for KV transfer communication
