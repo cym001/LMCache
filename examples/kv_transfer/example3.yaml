@@ -16,7 +16,7 @@ kv_transfer_host: "127.0.0.1"
 kv_transfer_http_port: 8012
 kv_transfer_init_port: 8213
 kv_transfer_rpc_port: 8214
-kv_transfer_model_name: "Qwen3-30B-A3B-Instruct-2507"
+kv_transfer_model_name: "DeepSeek-V2-Lite"
 transfer_channel: "nixl"
 
 # Controller configurations
