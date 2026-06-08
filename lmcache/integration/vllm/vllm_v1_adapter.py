@@ -45,7 +45,11 @@ from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
 from lmcache.v1.manager import LMCacheManager
-from lmcache.v1.remote.globalkv_client import KvCacheClient
+from lmcache.v1.plugin.kv_migration import (
+    KvMetadataReporterInterface,
+    KvMigrationPluginInterface,
+    load_kv_migration_plugin,
+)
 
 if TYPE_CHECKING:
     # Third Party
@@ -480,22 +484,28 @@ class LMCacheConnectorV1Impl:
 
         meta_host = config.get_extra_config_value("globalkv_meta_host", "127.0.0.1")
         meta_port = int(config.get_extra_config_value("globalkv_meta_port", 17070))
-        # GlobalKV NewRequest is sent from get_num_new_matched_tokens (scheduler);
-        # RequestEnd from request_finished (scheduler). Both are scheduler-side
-        # methods, so KvCacheClient must be available for the scheduler role.
-        global_kvclient: Optional[KvCacheClient] = None
-        try:
-            global_kvclient = KvCacheClient(config, meta_host, meta_port)
-        except Exception as e:
-            logger.warning("Failed to create GlobalKV client: %s", e)
+        kv_migration_plugin: Optional[KvMigrationPluginInterface] = (
+            load_kv_migration_plugin(config)
+        )
+        metadata_reporter: Optional[KvMetadataReporterInterface] = None
+        if kv_migration_plugin is not None:
+            create_reporter = getattr(
+                kv_migration_plugin, "create_metadata_reporter", None
+            )
+            if callable(create_reporter):
+                metadata_reporter = create_reporter(
+                    meta_host=str(meta_host),
+                    meta_port=meta_port,
+                )
 
         service_factory = VllmServiceFactory(
             config,
             vllm_config,
             role.name.lower(),
-            global_kvclient=global_kvclient,
+            metadata_reporter=metadata_reporter,
+            kv_migration_plugin=kv_migration_plugin,
         )
-        self._global_kvclient = global_kvclient
+        self._metadata_reporter = metadata_reporter
         self._manager = LMCacheManager(config, service_factory, connector=self)
 
         # Start services managed by LMCacheManager
@@ -1404,7 +1414,7 @@ class LMCacheConnectorV1Impl:
         # Report new inference requests to GlobalKV metadata service.
         # This runs for any role that has a GlobalKV client; the cache-lookup
         # path below is scheduler-only, so workers return early afterwards.
-        if self._global_kvclient is not None:
+        if self._metadata_reporter is not None:
             req_id = request.request_id
             if req_id not in self._global_kv_new_request_reported:
                 token_ids_for_gkv: list[int]
@@ -1423,7 +1433,7 @@ class LMCacheConnectorV1Impl:
                         : -self.skip_last_n_tokens
                     ]
                 try:
-                    self._global_kvclient.new_request(
+                    self._metadata_reporter.on_request_start(
                         req_id, token_ids_for_gkv
                     )
                     self._global_kv_new_request_reported.add(req_id)
@@ -1995,9 +2005,9 @@ class LMCacheConnectorV1Impl:
                     request_tracker.num_lmcache_cached_tokens
                 )
 
-        if self._global_kvclient is not None:
+        if self._metadata_reporter is not None:
             try:
-                self._global_kvclient.request_end(
+                self._metadata_reporter.on_request_end(
                     request.request_id, list(request.all_token_ids)
                 )
             except Exception as e:

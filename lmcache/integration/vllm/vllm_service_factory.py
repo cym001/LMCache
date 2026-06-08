@@ -15,7 +15,10 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
     # First Party
-    from lmcache.v1.remote.globalkv_client import KvCacheClient
+    from lmcache.v1.plugin.kv_migration import (
+        KvMetadataReporterInterface,
+        KvMigrationPluginInterface,
+    )
     from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
         LMCacheAsyncLookupServer,
     )
@@ -52,12 +55,16 @@ class VllmServiceFactory(BaseServiceFactory):
         lmcache_config: LMCacheEngineConfig,
         vllm_config: "VllmConfig",
         role: str,
-        global_kvclient: Optional["KvCacheClient"] = None,
+        metadata_reporter: Optional["KvMetadataReporterInterface"] = None,
+        kv_migration_plugin: Optional["KvMigrationPluginInterface"] = None,
+        global_kvclient: Optional["KvMetadataReporterInterface"] = None,
     ):
         self.lmcache_config = lmcache_config
         self.vllm_config = vllm_config
         self.role = role
-        self.global_kvclient = global_kvclient
+        self.metadata_reporter = metadata_reporter or global_kvclient
+        self.kv_migration_plugin = kv_migration_plugin
+        self.global_kvclient = self.metadata_reporter
         self.metadata: Optional[LMCacheMetadata] = None
         self.lmcache_engine: Optional[LMCacheEngine] = None
 
@@ -217,6 +224,8 @@ class VllmServiceFactory(BaseServiceFactory):
             vllm_gpu_connector,
             tpg.broadcast,
             tpg.broadcast_object,
+            metadata_reporter=self.metadata_reporter,
+            kv_migration_plugin=self.kv_migration_plugin,
             global_kvclient=self.global_kvclient,
         )
         self.lmcache_engine = engine

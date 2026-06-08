@@ -78,6 +78,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         dst_device: str = torch_device_type,
         lmcache_worker: Optional["LMCacheWorker"] = None,
         memory_allocator: Optional[MemoryAllocatorInterface] = None,
+        metadata_reporter: Optional[Any] = None,
         global_kvclient: Optional[Any] = None,
     ):
         if torch_dev.is_available():
@@ -110,7 +111,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # Store config and metadata for chunk budget calculation
         self.config = config
         self.metadata = metadata
-        self.global_kvclient = global_kvclient
+        self.metadata_reporter = metadata_reporter or global_kvclient
+        self.global_kvclient = self.metadata_reporter
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -1242,9 +1244,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 )
             )
 
-        if self.global_kvclient is not None:
+        if self.metadata_reporter is not None:
             try:
-                self.global_kvclient.remove_kv_meta(
+                self.metadata_reporter.on_kv_removed(
                     [_chunk_hash_to_32_bytes(chunk_hash) for chunk_hash in block_hashes]
                 )
             except Exception as exc:

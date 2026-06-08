@@ -18,7 +18,13 @@ import random
 import shlex
 import socket
 import subprocess
+import sys
 import time
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "plugins" / "kv_transfer"
+if PLUGIN_ROOT.exists() and str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
 
 # Third Party
 import numpy as np

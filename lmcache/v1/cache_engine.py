@@ -2,10 +2,8 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
-from concurrent.futures import Future
 from dataclasses import dataclass
 from functools import wraps
-import queue
 import threading
 from typing import (
     TYPE_CHECKING,
@@ -22,7 +20,10 @@ from typing import (
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.health_monitor.base import HealthMonitor
-    from lmcache.v1.remote.globalkv_client import KvCacheClient
+    from lmcache.v1.plugin.kv_migration import (
+        KvMetadataReporterInterface,
+        KvMigrationPluginInterface,
+    )
 
 # Standard
 import asyncio
@@ -50,11 +51,7 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.v1.kv_transfer_status import (
-    KV_TRANSFER_ALREADY_SATISFIED,
-    KV_TRANSFER_FAILED,
-    KV_TRANSFER_NOT_FOUND,
-)
+from lmcache.v1.kv_transfer_status import KV_TRANSFER_FAILED
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.hidden_state_store import HiddenStateStore
 from lmcache.v1.memory_allocators.cu_file_memory_allocator import CuFileMemoryAllocator
@@ -72,6 +69,11 @@ from lmcache.v1.memory_management import (
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.pin_monitor import PinMonitor
 from lmcache.v1.platform import current_device_spec
+from lmcache.v1.plugin.kv_migration import (
+    KvMetadataReporterInterface,
+    KvMigrationPluginInterface,
+    load_kv_migration_plugin,
+)
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.system_detection import NUMADetector, NUMAMapping
 from lmcache.v1.token_database import (
@@ -79,8 +81,6 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
-
-from lmcache.v1.remote.server.globalkv_server import GlobalKvServer
 
 logger = init_logger(__name__)
 
@@ -121,19 +121,6 @@ def _normalize_kv_event_hashes(event: CacheEvent) -> CacheEvent:
     if isinstance(event, CacheStoreEvent):
         event.parent_block_hash = _kv_event_parent_hash_to_u64(event.parent_block_hash)
     return event
-
-
-@dataclass
-class _KvTransferJob:
-    hashes: List[int]
-    offsets: List[int]
-    old_position: str
-    peer_ip: str
-    peer_init_port: int
-    event_id: str
-    do_copy: bool
-    token_ids: Optional[List[int]]
-    result: Future[int]
 
 
 @dataclass(frozen=True)
@@ -185,7 +172,9 @@ class LMCacheEngine:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
-        global_kvclient: Optional["KvCacheClient"] = None,
+        metadata_reporter: Optional[KvMetadataReporterInterface] = None,
+        kv_migration_plugin: Optional[KvMigrationPluginInterface] = None,
+        global_kvclient: Optional[KvMetadataReporterInterface] = None,
     ):
         logger.info("Creating LMCacheEngine with config: %s", config)
         self.config = config
@@ -248,27 +237,27 @@ class LMCacheEngine:
 
         self.async_loading = config.enable_async_loading
         self.event_manager = EventManager()
-        self.global_kvclient = global_kvclient
+        if metadata_reporter is not None:
+            self.metadata_reporter = metadata_reporter
+        elif global_kvclient is not None:
+            self.metadata_reporter = global_kvclient
+        else:
+            self.metadata_reporter = None
+
+        self._kv_migration_plugin = kv_migration_plugin or load_kv_migration_plugin(
+            config, metadata
+        )
+        if self.metadata_reporter is None and self._kv_migration_plugin is not None:
+            create_reporter = getattr(
+                self._kv_migration_plugin, "create_metadata_reporter", None
+            )
+            if callable(create_reporter):
+                self.metadata_reporter = create_reporter()
 
         self.use_layerwise = config.use_layerwise
 
-        # Initialize GlobalKvServer if enabled
-        self.globalkv_server: Optional[GlobalKvServer] = None
-        if getattr(config, "enable_globalkv_server", False):
-            # kv_transfer_rpc_ports is a list, get the first port or use default
-            rpc_port = getattr(config, "kv_transfer_rpc_port", 17071)
-
-            self.globalkv_server = GlobalKvServer(
-                cache_engine=self,
-                host=getattr(config, "kv_transfer_host", "0.0.0.0"),
-                port=rpc_port,
-                max_workers=getattr(config, "globalkv_server_max_workers", 10),
-            )
-            self.globalkv_server.start()
-            logger.info(
-                f"GlobalKvServer started on {self.globalkv_server.host}:"
-                f"{rpc_port}"
-            )
+        if self._kv_migration_plugin is not None:
+            self._kv_migration_plugin.start(self)
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -322,19 +311,6 @@ class LMCacheEngine:
 
         self._foreground_condition = threading.Condition()
         self._foreground_ops = 0
-        self._migration_worker_shutdown = False
-        queue_size = int(
-            self.config.get_extra_config_value("kv_transfer_queue_size", 1024)
-        )
-        self._migration_queue: queue.Queue[Optional[_KvTransferJob]] = queue.Queue(
-            maxsize=queue_size
-        )
-        self._migration_worker = threading.Thread(
-            target=self._migration_worker_loop,
-            name=f"LMCacheKvTransferWorker-{metadata.worker_id}",
-            daemon=True,
-        )
-        self._migration_worker.start()
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -445,7 +421,7 @@ class LMCacheEngine:
                     event_manager=self.event_manager,
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
-                    global_kvclient=self.global_kvclient,
+                    global_kvclient=self.metadata_reporter,
                 )
                 if self.hidden_state_store is not None:
                     self.hidden_state_store.bind_storage_manager(self.storage_manager)
@@ -453,13 +429,8 @@ class LMCacheEngine:
                 # that transfer events are appended directly here rather than
                 # kept in a separate per-backend queue.
                 if self.kv_events_enabled:
-                    kv_transfer_backend = (
-                        self.storage_manager.storage_backends.get(
-                            "KvTransferBackend"
-                        )
-                    )
-                    if kv_transfer_backend is not None:
-                        kv_transfer_backend.set_kv_events_sink(self.kv_events)
+                    if self._kv_migration_plugin is not None:
+                        self._kv_migration_plugin.configure_kv_events_sink(self)
                     local_cpu_backend = self.storage_manager.storage_backends.get(
                         "LocalCPUBackend"
                     )
@@ -530,58 +501,6 @@ class LMCacheEngine:
                 self._foreground_ops = 0
             if self._foreground_ops == 0:
                 self._foreground_condition.notify_all()
-
-    def _wait_for_foreground_idle(self) -> bool:
-        with self._foreground_condition:
-            while self._foreground_ops > 0 and not self._migration_worker_shutdown:
-                self._foreground_condition.wait(timeout=0.1)
-            return not self._migration_worker_shutdown
-
-    def _migration_worker_loop(self) -> None:
-        while True:
-            job = self._migration_queue.get()
-            try:
-                if job is None:
-                    return
-                if not self._wait_for_foreground_idle():
-                    job.result.set_result(-2)
-                    continue
-                result = self._execute_kv_transfer_job(job)
-                job.result.set_result(result)
-            except Exception as e:
-                logger.error("KV transfer worker failed: %s", e, exc_info=True)
-                if job is not None:
-                    job.result.set_result(-2)
-            finally:
-                self._migration_queue.task_done()
-
-    def _submit_kv_transfer_job(self, job: _KvTransferJob) -> int:
-        self._migration_queue.put(job)
-        return job.result.result()
-
-    def _stop_migration_worker(self) -> None:
-        self._migration_worker_shutdown = True
-        with self._foreground_condition:
-            self._foreground_condition.notify_all()
-
-        worker = getattr(self, "_migration_worker", None)
-        migration_queue = getattr(self, "_migration_queue", None)
-        if worker is None or migration_queue is None or not worker.is_alive():
-            return
-
-        while True:
-            try:
-                migration_queue.put_nowait(None)
-                break
-            except queue.Full:
-                try:
-                    pending_job = migration_queue.get_nowait()
-                except queue.Empty:
-                    continue
-                if pending_job is not None:
-                    pending_job.result.set_result(-2)
-                migration_queue.task_done()
-        worker.join(timeout=1.0)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -794,8 +713,8 @@ class LMCacheEngine:
         )
         tot_time = store_stats.time_to_store()
 
-        if self.global_kvclient is not None:
-            self.global_kvclient.upload_kv_meta(tokens)
+        if self.metadata_reporter is not None and tokens is not None:
+            self.metadata_reporter.on_kv_stored(convert_tokens_to_list(tokens))
 
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
@@ -872,11 +791,11 @@ class LMCacheEngine:
             -2 if transfer failed for other reasons
             
         """
-        if self._migration_worker_shutdown:
-            logger.warning("KV transfer rejected because migration worker is stopped")
+        if self._kv_migration_plugin is None:
+            logger.warning("KV transfer requested but no migration plugin is configured")
             return KV_TRANSFER_FAILED
 
-        job = _KvTransferJob(
+        return self._kv_migration_plugin.transfer(
             hashes=hashes,
             offsets=offsets,
             old_position=old_position,
@@ -885,162 +804,7 @@ class LMCacheEngine:
             event_id=event_id,
             do_copy=do_copy,
             token_ids=token_ids,
-            result=Future(),
         )
-        return self._submit_kv_transfer_job(job)
-
-    def _execute_kv_transfer_job(self, job: _KvTransferJob) -> int:
-        assert self.storage_manager is not None
-        memory_objs: Optional[List[Optional[MemoryObj]]] = None
-
-        # Step 1: Lookup the keys in the source location.
-        # lookup() implements longest-prefix matching: if a hash is missing,
-        # it stops at that point and only pins the matched prefix keys.
-        num_tokens = self.lookup(
-            hashes=job.hashes,
-            offsets=job.offsets,
-            search_range=[job.old_position],
-            lookup_id=job.event_id,
-            pin=True,
-        )
-
-        if not num_tokens:
-            logger.info(
-                "KV transfer is not performed as there are no tokens to "
-                "transfer. KV cache does not exist."
-            )
-            return KV_TRANSFER_NOT_FOUND
-
-        try:
-            block_mapping = self.lookup_pins[job.event_id]
-            # Extract only the keys that were actually found (longest prefix match).
-            # When hashes are missing in the middle, lookup stops at the first miss,
-            # so block_mapping[old_position] contains only the matched prefix chunks.
-            keys = block_mapping.get(job.old_position, [])
-            if not keys:
-                logger.info(
-                    "KV transfer is not performed as no matching keys were found "
-                    f"in {job.old_position}."
-                )
-                return KV_TRANSFER_NOT_FOUND
-
-            # Step 2: Get memory objects from the source location
-            memory_objs = self.storage_manager.batched_get(
-                keys=keys,
-                location=job.old_position,
-            )
-            if memory_objs is None or any(obj is None for obj in memory_objs):
-                logger.error("Failed to get memory objects to transfer")
-                return KV_TRANSFER_FAILED
-            transfer_objs = [obj for obj in memory_objs if obj is not None]
-            logger.info(
-                f"Trying to transfer {len(transfer_objs)} memory objects to "
-                f"peer {job.peer_ip}:{job.peer_init_port}"
-            )
-
-            # Step 3: Get KvTransferBackend and build full-sequence mem_indexes
-            kv_transfer_backend = self.storage_manager.storage_backends.get(
-                "KvTransferBackend"
-            )
-
-            if kv_transfer_backend is None:
-                logger.error(
-                    "KvTransferBackend is not available in storage backends"
-                )
-                return KV_TRANSFER_FAILED
-
-            hash_to_mem_index: dict[Any, int] = {}
-            local_indexes = kv_transfer_backend.transfer_channel.get_local_mem_indices(
-                transfer_objs
-            )
-            for key, mem_index in zip(keys, local_indexes, strict=False):
-                hash_to_mem_index[key.chunk_hash] = mem_index
-
-            from lmcache.v1.storage_backend.kv_transfer_backend import (
-                KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
-            )
-
-            full_mem_indexes: list[int] = []
-            source_prefix_broken = False
-            for chunk_hash in job.hashes:
-                if source_prefix_broken:
-                    full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
-                elif chunk_hash in hash_to_mem_index:
-                    full_mem_indexes.append(hash_to_mem_index[chunk_hash])
-                else:
-                    full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
-                    source_prefix_broken = True
-
-            # Step 4: Execute the transfer asynchronously
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    kv_transfer_backend.transfer_to_peer(
-                        peer_ip=job.peer_ip,
-                        peer_init_port=job.peer_init_port,
-                        hashes=job.hashes,
-                        objs=transfer_objs,
-                        offsets=job.offsets,
-                        event_id=job.event_id,
-                        token_ids=job.token_ids,
-                        mem_indexes=full_mem_indexes,
-                    ),
-                    self.storage_manager.loop,
-                )
-
-                transfer_result = future.result()
-                num_satisfied = transfer_result.num_satisfied_chunks
-                transfer_status = num_tokens
-
-                if num_satisfied != len(job.hashes):
-                    logger.warning(
-                        "Only %d/%d chunks were satisfied by peer "
-                        "(%d newly read, %d already existed)",
-                        num_satisfied,
-                        len(job.hashes),
-                        transfer_result.num_read_chunks,
-                        transfer_result.num_existing_chunks,
-                    )
-                    if num_satisfied == 0:
-                        return KV_TRANSFER_FAILED
-                elif transfer_result.all_already_satisfied:
-                    logger.info(
-                        "KV transfer already satisfied: peer %s:%s already "
-                        "has all %d requested chunks",
-                        job.peer_ip,
-                        job.peer_init_port,
-                        len(keys),
-                    )
-                    transfer_status = KV_TRANSFER_ALREADY_SATISFIED
-                else:
-                    transfer_status = num_tokens
-            except Exception as e:
-                logger.error(f"KV transfer failed with exception: {e}")
-                return KV_TRANSFER_FAILED
-
-            # Step 6: Optionally remove from source (if move instead of copy)
-            # Unpin before batched_remove so backends can still resolve keys
-            # (e.g. LocalCPUBackend.unpin).
-            if not job.do_copy:
-                self.lookup_unpin(job.event_id)
-                self.storage_manager.batched_remove(
-                    keys, locations=[job.old_position]
-                )
-                logger.info(
-                    f"Removed {len(keys)} chunks from source location "
-                    f"{job.old_position} after transfer"
-                )
-
-            logger.info(
-                f"KV transfer completed: status={transfer_status} from "
-                f"{job.old_position} to peer {job.peer_ip}:{job.peer_init_port}"
-            )
-            return transfer_status
-        finally:
-            self.lookup_unpin(job.event_id)
-            if memory_objs is not None:
-                for memory_obj in memory_objs:
-                    if memory_obj is not None:
-                        memory_obj.ref_count_down()
 
     def _upload_hit_kv_metadata(
         self,
@@ -1071,18 +835,16 @@ class LMCacheEngine:
             hit_tokens = [tokens_list[idx] for idx in hit_indices]
             
             # Upload to metadata server
-            if self.global_kvclient is not None:
-                success = self.global_kvclient.upload_kv_meta(hit_tokens)
-                if success:
-                    logger.debug(
-                        f"Successfully uploaded metadata for {len(hit_tokens)} hit tokens"
-                    )
-                else:
-                    logger.warning(
-                        f"Failed to upload metadata for {len(hit_tokens)} hit tokens"
-                    )
+            if self.metadata_reporter is not None:
+                self.metadata_reporter.on_kv_retrieved(hit_tokens)
+                logger.debug(
+                    "Uploaded metadata for %d hit tokens",
+                    len(hit_tokens),
+                )
             else:
-                logger.debug("global_kvclient is not initialized, skipping metadata upload")
+                logger.debug(
+                    "metadata_reporter is not initialized, skipping metadata upload"
+                )
                 
         except Exception as e:
             logger.error(f"Error uploading hit KV metadata: {e}", exc_info=True)
@@ -2298,7 +2060,8 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error("Error closing hidden_state_store: %s", e)
 
-        self._stop_migration_worker()
+        if self._kv_migration_plugin is not None:
+            self._kv_migration_plugin.stop()
 
         if self.lmcache_worker is not None:
             try:
@@ -2308,12 +2071,6 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error("Error closing lmcache_worker: %s", e)
 
-        # Stop GlobalKvServer if it's running
-        if self.globalkv_server is not None and self.globalkv_server.is_running():
-            logger.info("Stopping GlobalKvServer...")
-            self.globalkv_server.stop()
-            logger.info("GlobalKvServer stopped.")
-
         try:
             logger.info("Closing storage_manager...")
             if self.storage_manager is not None:
@@ -2322,11 +2079,11 @@ class LMCacheEngine:
         except Exception as e:
             logger.error("Error closing storage_manager: %s", e)
 
-        if self.global_kvclient is not None:
+        if self.metadata_reporter is not None:
             try:
-                self.global_kvclient.close()
+                self.metadata_reporter.close()
             except Exception as e:
-                logger.error(f"Error closing global_kvclient: {e}")
+                logger.error("Error closing metadata reporter: %s", e)
 
         logger.info("LMCacheEngine closed.")
 
@@ -2788,7 +2545,9 @@ class LMCacheEngineBuilder:
         gpu_connector: Optional[GPUConnectorInterface],
         broadcast_fn: Callable[[torch.Tensor, int], None],
         broadcast_object_fn: Callable[[Any, int], Any],
-        global_kvclient: Optional["KvCacheClient"] = None,
+        metadata_reporter: Optional[KvMetadataReporterInterface] = None,
+        kv_migration_plugin: Optional[KvMigrationPluginInterface] = None,
+        global_kvclient: Optional[KvMetadataReporterInterface] = None,
     ) -> LMCacheEngine:
         """
         Builds a new LMCacheEngine instance if it doesn't already exist for the
@@ -2815,6 +2574,8 @@ class LMCacheEngineBuilder:
                 gpu_connector,
                 broadcast_fn,
                 broadcast_object_fn,
+                metadata_reporter=metadata_reporter,
+                kv_migration_plugin=kv_migration_plugin,
                 global_kvclient=global_kvclient,
             )
 
