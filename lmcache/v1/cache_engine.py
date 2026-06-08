@@ -46,7 +46,7 @@ from lmcache.utils import (
     CacheStoreEvent,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
-    convert_tokens_to_list,
+    convert_token_span_to_list,
 )
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
@@ -714,7 +714,12 @@ class LMCacheEngine:
         tot_time = store_stats.time_to_store()
 
         if self.metadata_reporter is not None and tokens is not None:
-            self.metadata_reporter.on_kv_stored(convert_tokens_to_list(tokens))
+            stored_tokens: list[int] = []
+            for start, end in zip(starts, ends, strict=False):
+                stored_tokens.extend(
+                    convert_token_span_to_list(tokens, start, end)
+                )
+            self.metadata_reporter.on_kv_stored(stored_tokens)
 
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "
@@ -976,7 +981,7 @@ class LMCacheEngine:
                     lora_name=None,
                 )
                 if tokens is not None:
-                    stored_event.token_ids = convert_tokens_to_list(
+                    stored_event.token_ids = convert_token_span_to_list(
                         tokens,
                         start,
                         end,
@@ -1963,7 +1968,7 @@ class LMCacheEngine:
 
         token_ids = []
         if tokens is not None:
-            token_ids = convert_tokens_to_list(tokens, info.start, info.end)
+            token_ids = convert_token_span_to_list(tokens, info.start, info.end)
 
         stored_event = CacheStoreEvent(
             block_hashes=[info.key.chunk_hash],

@@ -15,6 +15,7 @@ from lmcache.utils import (
     _append_range_or_elements,
     cdiv,
     compress_slot_mapping,
+    convert_token_span_to_list,
     convert_tokens_to_list,
     decompress_slot_mapping,
     get_version,
@@ -229,6 +230,39 @@ class TestConvertTokensToList:
         t = torch.tensor([1, 2, 3])
         result = convert_tokens_to_list(t, 0, 2)
         assert result == [1, 2, 3]
+
+
+# ============================================================
+# convert_token_span_to_list
+# ============================================================
+class TestConvertTokenSpanToList:
+    def test_none_input(self):
+        assert convert_token_span_to_list(None, 0, 5) == []
+
+    def test_list_half_open_span(self):
+        tokens = [10, 20, 30, 40, 50]
+        result = convert_token_span_to_list(tokens, 1, 4)
+        assert result == [20, 30, 40]
+
+    def test_tensor_half_open_span(self):
+        t = torch.tensor([10, 20, 30, 40, 50])
+        result = convert_token_span_to_list(t, 0, 3)
+        assert result == [10, 20, 30]
+
+    def test_full_range(self):
+        tokens = [1, 2, 3]
+        result = convert_token_span_to_list(tokens, 0, 3)
+        assert result == [1, 2, 3]
+
+    def test_empty_span(self):
+        tokens = [1, 2, 3]
+        assert convert_token_span_to_list(tokens, 1, 1) == []
+
+    def test_half_open_matches_block_size(self):
+        tokens = list(range(256))
+        start, end = 0, 256
+        result = convert_token_span_to_list(tokens, start, end)
+        assert len(result) == end - start
 
 
 # ============================================================

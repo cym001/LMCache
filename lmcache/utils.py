@@ -315,6 +315,22 @@ def convert_tokens_to_list(
     )
 
 
+def convert_token_span_to_list(
+    tokens: Optional[Union[torch.Tensor, list[int]]],
+    token_start: int,
+    token_end: int,
+) -> List[int]:
+    """Convert a half-open token span ``[token_start, token_end)`` to a list."""
+    if tokens is None:
+        return []
+
+    return (
+        tokens.tolist()[token_start:token_end]
+        if isinstance(tokens, torch.Tensor)
+        else tokens[token_start:token_end]
+    )
+
+
 @dataclass
 class DiskCacheMetadata:
     path: str
