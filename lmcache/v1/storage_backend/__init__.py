@@ -239,23 +239,12 @@ def CreateStorageBackends(
         getattr(config, "enable_kv_transfer", False)
         and getattr(config, "kv_transfer_host", None) is not None
         and getattr(config, "kv_transfer_init_port", None) is not None
+        and not config.storage_plugins
     ):
-        # First Party
-        from lmcache.v1.storage_backend.kv_transfer_backend import KvTransferBackend
-
-        assert local_cpu_backend is not None
-        kv_transfer_backend = KvTransferBackend(
-            config=config,
-            metadata=metadata,
-            loop=loop,
-            local_cpu_backend=local_cpu_backend,
-            max_connections=config.kv_transfer_max_connections,
-            idle_timeout_seconds=config.kv_transfer_idle_timeout_seconds,
-            cleanup_interval_seconds=config.kv_transfer_cleanup_interval_seconds,
+        logger.warning(
+            "enable_kv_transfer without storage_plugins is deprecated; "
+            "configure storage_plugins: ['kv_transfer'] or install lmcache-kv-transfer"
         )
-        backend_name = str(kv_transfer_backend)
-        storage_backends[backend_name] = kv_transfer_backend
-        logger.info(f"Created KvTransferBackend: {backend_name}")
 
     if not config.enable_pd or config.local_cpu:
         # Load storage backends from configuration

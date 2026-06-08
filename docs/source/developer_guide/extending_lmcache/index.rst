@@ -126,5 +126,6 @@ Together, these extension points – custom storage backends, remote storage con
    runtime_plugins
    storage_plugins
    remote_storage_plugins
+   kv_migration_plugins
 
 

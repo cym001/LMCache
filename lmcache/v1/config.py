@@ -337,6 +337,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": None,
         "env_converter": _to_str_list,
     },
+    "kv_migration_plugins": {
+        "type": Optional[list[str]],
+        "default": None,
+        "env_converter": _to_str_list,
+    },
     "remote_storage_plugins": {
         "type": Optional[list[str]],
         "default": None,
@@ -600,6 +605,11 @@ def _validate_config(self):
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
+
+    # First Party
+    from lmcache.v1.plugin.kv_migration import apply_kv_transfer_plugin_compat
+
+    apply_kv_transfer_plugin_compat(self)
 
     if self.enable_blending:
         if not self.save_unfull_chunk:

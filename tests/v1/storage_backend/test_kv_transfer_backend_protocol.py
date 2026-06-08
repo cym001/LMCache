@@ -11,7 +11,7 @@ import torch
 # First Party
 from lmcache.v1.kv_event_utils import build_full_sequence_store_events
 from lmcache.v1.memory_management import MemoryFormat
-from lmcache.v1.storage_backend.kv_transfer_backend import (
+from lmcache_kv_transfer.backend import (
     BatchedLookupAndGetMsg,
     BatchedLookupAndPutMsg,
     KV_TRANSFER_MEM_INDEX_UNAVAILABLE,

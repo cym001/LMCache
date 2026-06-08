@@ -18,6 +18,8 @@ kv_transfer_init_port: 8227
 kv_transfer_rpc_port: 8228
 kv_transfer_model_name: "DeepSeek-V2-Lite"
 transfer_channel: "nixl"
+storage_plugins: ["kv_transfer"]
+kv_migration_plugins: ["globalkv"]
 
 # Controller configurations
 # enable_controller: True
@@ -36,3 +38,10 @@ internal_api_server_include_index_list: [1]
 
 extra_config:
   lookup_backoff_time: 0.001
+  storage_plugin.kv_transfer.module_path: lmcache_kv_transfer.backend
+  storage_plugin.kv_transfer.class_name: KvTransferBackend
+  kv_migration_plugin.globalkv.module_path: lmcache_kv_transfer.migration
+  kv_migration_plugin.globalkv.class_name: GlobalKvMigrationPlugin
+  kv_migration_plugin.globalkv.meta_host: 127.0.0.1
+  kv_migration_plugin.globalkv.meta_port: 17070
+  kv_migration_plugin.globalkv.enable_rpc_server: true
