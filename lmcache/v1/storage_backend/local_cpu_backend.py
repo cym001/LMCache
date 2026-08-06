@@ -108,6 +108,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.metadata = metadata
         self.metadata_reporter = metadata_reporter or global_kvclient
         self.global_kvclient = self.metadata_reporter
+        self._eviction_count = 0
 
         # to help maintain suffix -> prefix order in the dict
         # assumption: only one request is looked up at a time
@@ -672,6 +673,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return 0.0
         return self._allocator_used_bytes() / total
 
+    def capacity_snapshot(self) -> dict[str, int]:
+        """Return bounded scheduler inputs without exposing allocator internals."""
+        return {
+            "capacity_bytes": max(0, self._allocator_total_bytes()),
+            "used_bytes": max(0, self._allocator_used_bytes()),
+            "eviction_count": self._eviction_count,
+        }
+
     def _memory_pressure_above(self, watermark: float) -> bool:
         return self._allocator_usage_ratio() >= watermark
 
@@ -720,6 +729,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         for memory_obj in evicted_memory_objs:
             memory_obj.ref_count_down()
+        self._eviction_count += len(evicted_memory_objs)
         self._publish_remove_event(evicted_keys)
 
         if self.batched_msg_sender is not None:

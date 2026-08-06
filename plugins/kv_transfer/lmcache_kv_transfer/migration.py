@@ -79,6 +79,7 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
         self._ledger_lock = threading.Lock()
         self._ledger_revision = 0
         self._synced_revision = 0
+        self._engine: LMCacheEngine | None = None
         queue_size = max(
             1,
             int(
@@ -180,17 +181,26 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
             self._client.new_request(request_id, tokens)
         if self._client.protocol in {"dual", "v2"}:
             with self._ledger_lock:
-                candidates = sorted(
-                    self._ledger.values(), key=lambda block: block.position
-                )
+                candidates = list(self._ledger.values())
             matched: list[KvBlockMetadata] = []
             cursor = 0
-            for block in candidates:
-                block_tokens = list(block.token_ids)
-                if tokens[cursor : cursor + len(block_tokens)] != block_tokens:
+            parent_hash: bytes | None = None
+            while cursor < len(tokens):
+                block = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.parent_hash == parent_hash
+                        and list(candidate.token_ids)
+                        == tokens[cursor : cursor + len(candidate.token_ids)]
+                    ),
+                    None,
+                )
+                if block is None:
                     break
                 matched.append(block)
-                cursor += len(block_tokens)
+                cursor += len(block.token_ids)
+                parent_hash = block.seq_hash
             self._enqueue_metadata(
                 _MetadataEvent(
                     kind="request_start",
@@ -251,7 +261,7 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
             except queue.Empty:
                 event = None
             if time.monotonic() >= next_heartbeat:
-                self._client.heartbeat()
+                self._client.heartbeat(self._capacity_snapshot())
                 lease_interval = (
                     self._client.lease_ttl_ms / 3000.0
                     if self._client.lease_ttl_ms > 0
@@ -319,6 +329,24 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
     def ledger_snapshot(self) -> dict[bytes, KvBlockMetadata]:
         with self._ledger_lock:
             return dict(self._ledger)
+
+    def bind_engine(self, engine: "LMCacheEngine") -> None:
+        self._engine = engine
+
+    def _capacity_snapshot(self) -> dict[str, int] | None:
+        engine = self._engine
+        storage_manager = getattr(engine, "storage_manager", None)
+        if storage_manager is None:
+            return None
+        storage_backends = getattr(storage_manager, "storage_backends", {})
+        backend = storage_backends.get("LocalCPUBackend")
+        if backend is None or not hasattr(backend, "capacity_snapshot"):
+            return None
+        try:
+            return backend.capacity_snapshot()
+        except Exception:
+            logger.exception("Failed to read LocalCPUBackend capacity snapshot")
+            return None
 
     def replica_version(self, seq_hash: bytes) -> int:
         with self._ledger_lock:
@@ -424,6 +452,7 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             and engine.metadata is not None
         ):
             self._metadata_reporter.bind_instance_identity(engine.metadata)
+            self._metadata_reporter.bind_engine(engine)
 
         enable_rpc_server = bool(
             self.plugin_params.get(

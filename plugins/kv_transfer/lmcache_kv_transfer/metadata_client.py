@@ -329,15 +329,20 @@ class KvCacheClient:
             logger.warning("GlobalKV V2 mutation requires recovery: %s", exc)
             return 0
     
-    def heartbeat(self) -> bool:
+    def heartbeat(self, capacity: dict[str, int] | None = None) -> bool:
         if self.v2_stub is None or self.instance_key is None:
             return False
         try:
+            request = kvcache_v2_pb2.HeartbeatV2Request(
+                session=self._session(),
+                known_meta_generation=self.meta_generation,
+            )
+            if capacity is not None:
+                request.capacity.CopyFrom(
+                    kvcache_v2_pb2.CapacitySnapshotV2(**capacity)
+                )
             response = self.v2_stub.Heartbeat(
-                kvcache_v2_pb2.HeartbeatV2Request(
-                    session=self._session(),
-                    known_meta_generation=self.meta_generation,
-                ),
+                request,
                 timeout=self.rpc_timeout,
             )
             if response.require_registration:
