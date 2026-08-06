@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import List
 import hashlib
+import ipaddress
 import os
 import threading
 import time
@@ -81,9 +82,40 @@ class KvCacheClient:
         self.data_server_init_port = config.kv_transfer_init_port
         self.data_server_rpc_port = config.kv_transfer_rpc_port
         self.model_name = config.kv_transfer_model_name
+        self.advertised_host = str(
+            config.get_extra_config_value(
+                "globalkv_advertised_host", self.data_server_ip
+            )
+        )
+        self.api_scheme = str(
+            config.get_extra_config_value("globalkv_api_scheme", "http")
+        )
+        self.api_path = str(
+            config.get_extra_config_value("globalkv_api_path", "/v1")
+        )
+        if self.api_scheme not in {"http", "https"}:
+            raise ValueError("globalkv_api_scheme must be http or https")
+        if not self.api_path.startswith("/"):
+            raise ValueError("globalkv_api_path must start with /")
+        if not self.advertised_host or self.advertised_host in {"0.0.0.0", "::"}:
+            raise ValueError(
+                "globalkv_advertised_host must be a routable host, not a wildcard"
+            )
+        if self.protocol in {"v1", "dual"}:
+            try:
+                ipaddress.ip_address(self.advertised_host)
+            except ValueError as exc:
+                raise ValueError(
+                    "V1/dual globalkv_advertised_host must be an IP address"
+                ) from exc
+        self.api_host = (
+            f"[{self.advertised_host}]"
+            if ":" in self.advertised_host
+            else self.advertised_host
+        )
         
         # 生成server_id: ip+http_port的hash值
-        id_str = f"{self.data_server_ip}:{self.data_server_http_port}"
+        id_str = f"{self.advertised_host}:{self.data_server_http_port}"
         self.server_id = hash(id_str) & 0xFFFFFFFF  # 转换为无符号32位整数
 
         self.connect()
@@ -227,11 +259,11 @@ class KvCacheClient:
             protocol_minor=0,
             instance=identity,
             endpoints=kvcache_v2_pb2.InstanceEndpointsV2(
-                host=self.data_server_ip,
+                host=self.advertised_host,
                 http_port=self.data_server_http_port,
                 nixl_init_port=self.data_server_init_port,
                 transfer_rpc_port=self.data_server_rpc_port,
-                api_path="/v1",
+                api_path=self.api_path,
             ),
             fingerprint=fingerprint,
             known_meta_generation=self.meta_generation,
@@ -543,13 +575,15 @@ class KvCacheClient:
         # 构建请求消息
         data_server = kvcache_pb2.DataServer(
             id=self.server_id,
-            ip=self.data_server_ip,
+            ip=self.advertised_host,
             http_port=self.data_server_http_port,
             init_port=self.data_server_init_port,
             rpc_port=self.data_server_rpc_port,
             model_name=self.model_name,
-            # url=f"http://localhost:{self.data_server_http_port[0]}/v1/completions"
-            url=f"http://localhost:{self.data_server_http_port}/v1"
+            url=(
+                f"{self.api_scheme}://{self.api_host}:"
+                f"{self.data_server_http_port}{self.api_path}"
+            ),
         )
         
         request = kvcache_pb2.RegisterInstanceRequest(

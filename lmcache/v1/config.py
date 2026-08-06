@@ -457,7 +457,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "env_converter": str,
         "description": (
             "GlobalKV control-plane protocol: v1, dual, or v2. "
-            "The default preserves the existing V1 behavior."
+            "V1 is retained for one compatibility release but is deprecated."
         ),
     },
     # Lazy memory allocator configurations
@@ -614,6 +614,8 @@ def _validate_config(self):
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
         )
+    if not 1 <= self.chunk_size <= 0xFFFFFFFF:
+        raise ValueError("chunk_size must be between 1 and uint32 max")
 
     if self.globalkv_protocol not in {"v1", "dual", "v2"}:
         raise ValueError(
@@ -623,6 +625,43 @@ def _validate_config(self):
     if self.globalkv_protocol != "v1" and not self.lmcache_instance_id:
         raise ValueError(
             "lmcache_instance_id is required when globalkv_protocol is dual or v2"
+        )
+    if self.globalkv_protocol in {"dual", "v2"}:
+        if self.pre_caching_hash_algorithm not in {"builtin", "sha256_cbor"}:
+            raise ValueError(
+                "dual/v2 GlobalKV requires builtin or sha256_cbor hashing"
+            )
+        if (
+            self.pre_caching_hash_algorithm == "builtin"
+            and os.environ.get("PYTHONHASHSEED") is None
+        ):
+            raise ValueError(
+                "PYTHONHASHSEED is required for builtin hashing with dual/v2 GlobalKV"
+            )
+    transfer_ports = {
+        "kv_transfer_http_port": self.kv_transfer_http_port,
+        "kv_transfer_init_port": self.kv_transfer_init_port,
+        "kv_transfer_rpc_port": self.kv_transfer_rpc_port,
+    }
+    for name, port in transfer_ports.items():
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError(f"{name} must be between 1 and 65535")
+    if self.enable_kv_transfer or self.globalkv_protocol in {"dual", "v2"}:
+        if not self.kv_transfer_host or any(
+            port is None for port in transfer_ports.values()
+        ):
+            raise ValueError(
+                "GlobalKV requires kv_transfer_host and all transfer ports"
+            )
+        if not self.kv_transfer_model_name:
+            raise ValueError(
+                "kv_transfer_model_name is required for GlobalKV"
+            )
+    if self.kv_transfer_max_connections <= 0:
+        raise ValueError("kv_transfer_max_connections must be greater than 0")
+    if self.globalkv_protocol == "v1" and self.enable_kv_transfer:
+        logger.warning(
+            "globalkv_protocol=v1 is deprecated; migrate through dual to v2"
         )
 
     # First Party
