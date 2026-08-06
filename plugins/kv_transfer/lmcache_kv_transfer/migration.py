@@ -20,6 +20,7 @@ from lmcache.v1.kv_transfer_status import (
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.plugin.kv_migration import (
+    KvBlockMetadata,
     KvMetadataReporterInterface,
     KvMigrationPluginInterface,
     find_kv_transfer_backend,
@@ -54,30 +55,59 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
 
     def __init__(self, client: KvCacheClient) -> None:
         self._client = client
+        self._ledger: dict[bytes, KvBlockMetadata] = {}
+        self._ledger_lock = threading.Lock()
 
     def on_kv_stored(self, tokens: list[int]) -> None:
-        self._client.upload_kv_meta(tokens)
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.upload_kv_meta(tokens)
+
+    def on_kv_stored_structured(self, blocks: list[KvBlockMetadata]) -> None:
+        if not blocks:
+            return
+        with self._ledger_lock:
+            for block in blocks:
+                self._ledger[block.seq_hash] = block
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.upload_kv_meta(
+                [token for block in blocks for token in block.token_ids]
+            )
+        if self._client.protocol in {"dual", "v2"}:
+            self._client.report_stored_blocks(blocks)
 
     def on_kv_retrieved(self, hit_tokens: list[int]) -> None:
-        self._client.upload_kv_meta(hit_tokens)
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.upload_kv_meta(hit_tokens)
 
     def on_kv_removed(self, chunk_hashes: list[bytes]) -> None:
-        self._client.remove_kv_meta(chunk_hashes)
+        with self._ledger_lock:
+            for chunk_hash in chunk_hashes:
+                self._ledger.pop(chunk_hash, None)
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.remove_kv_meta(chunk_hashes)
+        if self._client.protocol in {"dual", "v2"}:
+            self._client.report_removed_blocks(chunk_hashes)
 
     def on_request_start(self, request_id: str, tokens: list[int]) -> None:
-        self._client.new_request(request_id, tokens)
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.new_request(request_id, tokens)
 
     def on_request_end(self, request_id: str, tokens: list[int]) -> None:
-        self._client.request_end(request_id, tokens)
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.request_end(request_id, tokens)
 
     def close(self) -> None:
         self._client.close()
+
+    def ledger_snapshot(self) -> dict[bytes, KvBlockMetadata]:
+        with self._ledger_lock:
+            return dict(self._ledger)
 
     def bind_instance_identity(self, metadata: LMCacheMetadata) -> None:
         instance_id = self._client.config.lmcache_instance_id
         if instance_id is None:
             return
-        self._client.bind_instance_identity(instance_id, metadata.worker_id)
+        self._client.bind_instance_identity(instance_id, metadata)
 
 
 class GlobalKvMigrationPlugin(KvMigrationPluginInterface):

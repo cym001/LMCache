@@ -2,12 +2,16 @@
 # Standard
 from dataclasses import dataclass
 from typing import List
+import os
+import uuid
 
 # Third Party
 import grpc
 
 from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.plugin.kv_migration import KvBlockMetadata
 
 try:
     from lmcache_kv_transfer.proto import kvcache_pb2
@@ -16,6 +20,15 @@ except ImportError as exc:
     raise ImportError(
         "GlobalKV proto modules are missing from lmcache_kv_transfer.proto"
     ) from exc
+
+try:
+    from lmcache_kv_transfer.proto import kvcache_v2_pb2
+    from lmcache_kv_transfer.proto import kvcache_v2_pb2_grpc
+    from lmcache_kv_transfer.proto import v2_descriptor_sha256
+except (ImportError, RuntimeError):
+    kvcache_v2_pb2 = None
+    kvcache_v2_pb2_grpc = None
+    v2_descriptor_sha256 = None
 
 logger = init_logger(__name__)
 
@@ -43,8 +56,12 @@ class KvCacheClient:
         self.meta_server_port = meta_server_port
         self.channel = None
         self.stub = None
-        self.v2_capabilities_rpc = None
+        self.v2_stub = None
         self.instance_key: InstanceKey | None = None
+        self.instance_epoch = str(uuid.uuid4())
+        self.compatibility_group_id = b""
+        self.lease_id = ""
+        self.event_seq = 0
         self.protocol = getattr(config, "globalkv_protocol", "v1")
         self.rpc_timeout = float(
             config.get_extra_config_value("globalkv_rpc_timeout_seconds", 5.0)
@@ -73,11 +90,8 @@ class KvCacheClient:
         self.channel = grpc.insecure_channel(f'{self.meta_server_host}:{self.meta_server_port}')
         if self.protocol in {"v1", "dual"}:
             self.stub = kvcache_pb2_grpc.KvMeta2DataStub(self.channel)
-        self.v2_capabilities_rpc = self.channel.unary_unary(
-            "/kvcache.v2.KvMeta2DataV2/GetCapabilities",
-            request_serializer=lambda _request: b"",
-            response_deserializer=lambda payload: payload,
-        )
+        if kvcache_v2_pb2_grpc is not None:
+            self.v2_stub = kvcache_v2_pb2_grpc.KvMeta2DataV2Stub(self.channel)
         logger.info(
             "Connected to GlobalKV metadata server %s:%s as legacy server id %s",
             self.meta_server_host,
@@ -86,16 +100,30 @@ class KvCacheClient:
         )
 
     def _negotiate_v2_capabilities(self) -> None:
-        """Probe the additive V2 service without depending on generated bindings.
-
-        The phase-A request is an empty protobuf message and the response payload
-        is intentionally opaque. Descriptor-backed V2 calls are enabled in later
-        phases after bindings have passed the cross-language checksum gate.
-        """
-        assert self.v2_capabilities_rpc is not None
+        """Verify protocol version and the cross-language descriptor checksum."""
+        if (
+            self.v2_stub is None
+            or kvcache_v2_pb2 is None
+            or v2_descriptor_sha256 is None
+        ):
+            message = "generated GlobalKV V2 Python bindings are unavailable"
+            if self.protocol == "v2":
+                raise RuntimeError(message)
+            logger.warning("%s; V1 reporting remains active", message)
+            return
         try:
-            self.v2_capabilities_rpc(b"", timeout=self.rpc_timeout)
-        except grpc.RpcError as exc:
+            response = self.v2_stub.GetCapabilities(
+                kvcache_v2_pb2.GetCapabilitiesRequestV2(),
+                timeout=self.rpc_timeout,
+            )
+            if response.protocol_major != 2:
+                raise RuntimeError(
+                    f"unsupported GlobalKV protocol major {response.protocol_major}"
+                )
+            local_digest = v2_descriptor_sha256()
+            if bytes(response.descriptor_sha256) != local_digest:
+                raise RuntimeError("GlobalKV V2 descriptor checksum mismatch")
+        except (grpc.RpcError, RuntimeError) as exc:
             if self.protocol == "v2":
                 raise RuntimeError("GlobalKV V2 capability handshake failed") from exc
             logger.warning(
@@ -103,8 +131,13 @@ class KvCacheClient:
                 "V1 reporting remains active: %s",
                 exc,
             )
+            self.v2_stub = None
 
-    def bind_instance_identity(self, lmcache_instance_id: str, worker_id: int) -> None:
+    def bind_instance_identity(
+        self,
+        lmcache_instance_id: str,
+        metadata: LMCacheMetadata,
+    ) -> None:
         """Bind V2 identity after LMCache engine metadata becomes available.
 
         worker_id is the global distributed rank embedded in CacheEngineKey.
@@ -112,9 +145,159 @@ class KvCacheClient:
         """
         if not lmcache_instance_id:
             raise ValueError("lmcache_instance_id must not be empty")
-        if worker_id < 0:
+        if metadata.worker_id < 0:
             raise ValueError("worker_id must be non-negative")
-        self.instance_key = InstanceKey(lmcache_instance_id, worker_id)
+        self.instance_key = InstanceKey(lmcache_instance_id, metadata.worker_id)
+        if self.protocol in {"dual", "v2"}:
+            self._register_instance_v2(metadata)
+
+    def _register_instance_v2(self, metadata: LMCacheMetadata) -> None:
+        if kvcache_v2_pb2 is None or kvcache_v2_pb2_grpc is None:
+            message = "generated GlobalKV V2 Python bindings are unavailable"
+            if self.protocol == "v2":
+                raise RuntimeError(message)
+            logger.warning("%s; V1 reporting remains active", message)
+            return
+        assert self.channel is not None
+        assert self.instance_key is not None
+        if self.v2_stub is None:
+            return
+        identity = kvcache_v2_pb2.InstanceIdentityV2(
+            key=kvcache_v2_pb2.InstanceKeyV2(
+                lmcache_instance_id=self.instance_key.lmcache_instance_id,
+                worker_id=self.instance_key.worker_id,
+            ),
+            epoch=self.instance_epoch,
+        )
+        world_size = metadata.world_size
+        tp_size = int(
+            self.config.get_extra_config_value(
+                "globalkv_tensor_parallel_size", world_size
+            )
+        )
+        pp_size = int(
+            self.config.get_extra_config_value("globalkv_pipeline_parallel_size", 1)
+        )
+        if tp_size <= 0 or pp_size <= 0 or tp_size * pp_size != world_size:
+            raise ValueError(
+                "GlobalKV TP/PP sizes must be positive and multiply to world_size"
+            )
+        fingerprint = kvcache_v2_pb2.CompatibilityFingerprintV2(
+            model_name=metadata.model_name,
+            model_revision=str(
+                self.config.get_extra_config_value("globalkv_model_revision", "")
+            ),
+            tokenizer_name=str(
+                self.config.get_extra_config_value("globalkv_tokenizer_name", "")
+            ),
+            tokenizer_revision=str(
+                self.config.get_extra_config_value("globalkv_tokenizer_revision", "")
+            ),
+            hash_algorithm=self.config.pre_caching_hash_algorithm,
+            hash_seed=int(self.config.get_extra_config_value("globalkv_hash_seed", 0)),
+            python_hash_seed=os.environ.get("PYTHONHASHSEED", ""),
+            chunk_size=metadata.chunk_size,
+            save_unfull_chunk=self.config.save_unfull_chunk,
+            kv_dtype=",".join(str(dtype) for dtype in metadata.get_dtypes()),
+            kv_layout="mla" if metadata.use_mla else "kv",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            world_size=world_size,
+            worker_id=metadata.worker_id,
+            tensor_parallel_rank=metadata.worker_id % tp_size,
+            pipeline_parallel_rank=metadata.worker_id // tp_size,
+        )
+        request = kvcache_v2_pb2.RegisterInstanceV2Request(
+            protocol_major=2,
+            protocol_minor=0,
+            instance=identity,
+            endpoints=kvcache_v2_pb2.InstanceEndpointsV2(
+                host=self.data_server_ip,
+                http_port=self.data_server_http_port,
+                nixl_init_port=self.data_server_init_port,
+                transfer_rpc_port=self.data_server_rpc_port,
+                api_path="/v1",
+            ),
+            fingerprint=fingerprint,
+        )
+        try:
+            response = self.v2_stub.RegisterInstance(
+                request,
+                timeout=self.rpc_timeout,
+            )
+            if response.status != kvcache_v2_pb2.REGISTER_STATUS_V2_ACCEPTED:
+                raise RuntimeError(f"GlobalKV V2 registration rejected: {response.error_detail}")
+            self.compatibility_group_id = bytes(response.compatibility_group_id)
+            self.lease_id = response.lease_id
+        except (grpc.RpcError, RuntimeError) as exc:
+            if self.protocol == "v2":
+                raise
+            logger.warning("GlobalKV V2 registration failed; V1 remains active: %s", exc)
+            self.v2_stub = None
+
+    def report_stored_blocks(self, blocks: list[KvBlockMetadata]) -> None:
+        if not blocks or self.v2_stub is None:
+            return
+        proto_blocks = [
+            kvcache_v2_pb2.BlockDescriptorV2(
+                seq_hash=block.seq_hash,
+                parent_hash=block.parent_hash or b"",
+                position=block.position,
+                offset=block.offset,
+                token_ids=block.token_ids,
+            )
+            for block in blocks
+        ]
+        self._report_mutation(store=kvcache_v2_pb2.StoreBlocksV2(blocks=proto_blocks))
+
+    def report_removed_blocks(self, seq_hashes: list[bytes]) -> None:
+        if not seq_hashes or self.v2_stub is None:
+            return
+        self._report_mutation(
+            remove=kvcache_v2_pb2.RemoveBlocksV2(seq_hashes=seq_hashes)
+        )
+
+    def _report_mutation(self, **payload) -> None:
+        assert self.instance_key is not None
+        self.event_seq += 1
+        identity = kvcache_v2_pb2.InstanceIdentityV2(
+            key=kvcache_v2_pb2.InstanceKeyV2(
+                lmcache_instance_id=self.instance_key.lmcache_instance_id,
+                worker_id=self.instance_key.worker_id,
+            ),
+            epoch=self.instance_epoch,
+        )
+        request = kvcache_v2_pb2.ReportCacheMutationsV2Request(
+            session=kvcache_v2_pb2.InstanceSessionV2(
+                instance=identity,
+                lease_id=self.lease_id,
+            ),
+            compatibility_group_id=self.compatibility_group_id,
+            events=[
+                kvcache_v2_pb2.CacheMutationEventV2(
+                    event_seq=self.event_seq,
+                    **payload,
+                )
+            ],
+        )
+        try:
+            response = self.v2_stub.ReportCacheMutations(
+                request,
+                timeout=self.rpc_timeout,
+            )
+            accepted = {
+                kvcache_v2_pb2.MUTATION_STATUS_V2_COMMITTED,
+                kvcache_v2_pb2.MUTATION_STATUS_V2_DUPLICATE,
+            }
+            if response.status not in accepted:
+                raise RuntimeError(
+                    "GlobalKV V2 mutation rejected: "
+                    f"status={response.status} detail={response.error_detail}"
+                )
+        except (grpc.RpcError, RuntimeError) as exc:
+            if self.protocol == "v2":
+                raise
+            logger.warning("GlobalKV V2 shadow mutation failed: %s", exc)
     
     def close(self):
         """关闭连接"""

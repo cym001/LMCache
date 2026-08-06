@@ -3,6 +3,7 @@
 
 # Standard
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 import importlib
 
@@ -25,12 +26,28 @@ DEFAULT_KV_MIGRATION_MODULE = "lmcache_kv_transfer.migration"
 DEFAULT_KV_MIGRATION_CLASS = "GlobalKvMigrationPlugin"
 
 
+@dataclass(frozen=True, slots=True)
+class KvBlockMetadata:
+    """Metadata for one exact CacheEngineKey chunk stored in the hot cache."""
+
+    seq_hash: bytes
+    parent_hash: bytes | None
+    position: int
+    offset: int
+    token_ids: tuple[int, ...]
+
+
 class KvMetadataReporterInterface(ABC):
     """Reports KV cache metadata lifecycle events to an external service."""
 
     @abstractmethod
     def on_kv_stored(self, tokens: list[int]) -> None:
         """Report tokens stored into the local cache."""
+
+    def on_kv_stored_structured(self, blocks: list[KvBlockMetadata]) -> None:
+        """Report exact stored chunks, with a V1-compatible default adapter."""
+        tokens = [token for block in blocks for token in block.token_ids]
+        self.on_kv_stored(tokens)
 
     @abstractmethod
     def on_kv_retrieved(self, hit_tokens: list[int]) -> None:

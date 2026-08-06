@@ -8,9 +8,20 @@ from typing import Any, Optional
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, CacheStoreEvent
+from lmcache.v1.plugin.kv_migration import KvBlockMetadata
 from lmcache.v1.token_database import TokenDatabase
 
 logger = init_logger(__name__)
+
+
+def chunk_hash_to_32_bytes(chunk_hash: Any) -> bytes:
+    """Normalize LMCache's integer/bytes chunk hash representation."""
+    if isinstance(chunk_hash, int):
+        return (chunk_hash & ((1 << 256) - 1)).to_bytes(32, "big", signed=False)
+    value = bytes(chunk_hash)
+    if len(value) > 32:
+        return value[-32:]
+    return value.rjust(32, b"\x00")
 
 
 def build_full_sequence_chunk_infos(
@@ -41,6 +52,38 @@ def build_full_sequence_chunk_infos(
         assert isinstance(key, CacheEngineKey)
         infos.append((start, end, key, parent_by_span[(start, end)]))
     return infos
+
+
+def build_stored_block_metadata(
+    token_database: TokenDatabase,
+    token_ids: list[int],
+    stored_keys: Sequence[CacheEngineKey],
+    request_configs: Optional[dict] = None,
+) -> list[KvBlockMetadata]:
+    """Build descriptors for the exact keys that reached the local hot cache."""
+    stored_hashes = {key.chunk_hash for key in stored_keys}
+    descriptors: list[KvBlockMetadata] = []
+    for position, (start, end, key, parent) in enumerate(
+        build_full_sequence_chunk_infos(
+            token_database,
+            token_ids,
+            request_configs=request_configs,
+        )
+    ):
+        if key.chunk_hash not in stored_hashes:
+            continue
+        descriptors.append(
+            KvBlockMetadata(
+                seq_hash=chunk_hash_to_32_bytes(key.chunk_hash),
+                parent_hash=(
+                    None if parent is None else chunk_hash_to_32_bytes(parent)
+                ),
+                position=position,
+                offset=end - start,
+                token_ids=tuple(token_ids[start:end]),
+            )
+        )
+    return descriptors
 
 
 def build_full_sequence_store_events(

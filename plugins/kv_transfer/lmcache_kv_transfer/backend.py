@@ -30,6 +30,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.kv_event_utils import (
     build_migrated_store_events,
+    build_stored_block_metadata,
     validate_full_sequence_token_ids,
 )
 from lmcache.v1.token_database import (
@@ -643,6 +644,7 @@ class KvTransferBackend(StoragePluginInterface):
                     token_ids=token_ids,
                     offsets=offsets,
                     event_id=event_id,
+                    report_metadata=True,
                 )
 
                 return BatchedLookupAndPutRetMsg(
@@ -701,15 +703,27 @@ class KvTransferBackend(StoragePluginInterface):
         token_ids: Optional[list[int]],
         offsets: list[int],
         event_id: str,
+        report_metadata: bool = False,
     ) -> None:
         """Publish store events only for newly migrated chunks."""
-        if not migrated_keys or self.kv_events is None or not token_ids:
+        if not migrated_keys or not token_ids:
             return
 
         if not validate_full_sequence_token_ids(token_ids, offsets, event_id):
             return
 
         pre_existing_hashes = {key.chunk_hash for key in pre_existing_keys}
+        if report_metadata and self.local_cpu_backend.metadata_reporter is not None:
+            descriptors = build_stored_block_metadata(
+                self.token_database,
+                token_ids,
+                migrated_keys,
+            )
+            self.local_cpu_backend.metadata_reporter.on_kv_stored_structured(
+                descriptors
+            )
+        if self.kv_events is None:
+            return
         for event in build_migrated_store_events(
             self.token_database,
             token_ids,

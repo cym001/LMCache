@@ -50,8 +50,9 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
-from lmcache.v1.kv_transfer_status import KV_TRANSFER_FAILED
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
+from lmcache.v1.kv_event_utils import build_stored_block_metadata
+from lmcache.v1.kv_transfer_status import KV_TRANSFER_FAILED
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
     MemoryAllocatorInterface,
@@ -686,12 +687,26 @@ class LMCacheEngine:
         tot_time = store_stats.time_to_store()
 
         if self.metadata_reporter is not None and tokens is not None:
-            stored_tokens: list[int] = []
-            for start, end in zip(starts, ends, strict=False):
-                stored_tokens.extend(
-                    convert_token_span_to_list(tokens, start, end)
+            token_ids = convert_token_span_to_list(tokens, 0, len(tokens))
+            local_keys: list[CacheEngineKey] = []
+            local_backend = self.storage_manager.local_cpu_backend
+            if local_backend is None:
+                stored_tokens = [
+                    token
+                    for start, end in zip(starts, ends, strict=False)
+                    for token in convert_token_span_to_list(tokens, start, end)
+                ]
+                self.metadata_reporter.on_kv_stored(stored_tokens)
+            else:
+                hot_hashes = {key.chunk_hash for key in local_backend.get_keys()}
+                local_keys = [key for key in keys if key.chunk_hash in hot_hashes]
+                descriptors = build_stored_block_metadata(
+                    self.token_database,
+                    token_ids,
+                    local_keys,
+                    request_configs=request_configs,
                 )
-            self.metadata_reporter.on_kv_stored(stored_tokens)
+                self.metadata_reporter.on_kv_stored_structured(descriptors)
 
         logger.info(
             "[req_id=%s] Stored %d out of total %d tokens. "

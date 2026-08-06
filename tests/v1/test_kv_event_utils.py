@@ -4,6 +4,8 @@ from lmcache.utils import CacheEngineKey
 from lmcache.v1.kv_event_utils import (
     build_full_sequence_store_events,
     build_migrated_store_events,
+    build_stored_block_metadata,
+    chunk_hash_to_32_bytes,
     validate_full_sequence_token_ids,
 )
 from lmcache.v1.token_database import ChunkedTokenDatabase
@@ -109,3 +111,38 @@ def test_validate_full_sequence_token_ids_rejects_mismatch() -> None:
         )
         is False
     )
+
+
+def test_stored_block_metadata_uses_full_parent_chain_for_suffix() -> None:
+    token_database = _make_token_database()
+    tokens = list(range(64))
+    keys = _keys_from_tokens(token_database, tokens)
+
+    descriptors = build_stored_block_metadata(
+        token_database,
+        tokens,
+        stored_keys=[keys[2], keys[3]],
+    )
+
+    assert [descriptor.position for descriptor in descriptors] == [2, 3]
+    assert descriptors[0].seq_hash == chunk_hash_to_32_bytes(keys[2].chunk_hash)
+    assert descriptors[0].parent_hash == chunk_hash_to_32_bytes(keys[1].chunk_hash)
+    assert descriptors[0].token_ids == tuple(tokens[32:48])
+    assert descriptors[1].parent_hash == descriptors[0].seq_hash
+
+
+def test_stored_block_metadata_reports_only_actual_keys() -> None:
+    token_database = _make_token_database()
+    tokens = list(range(48))
+    keys = _keys_from_tokens(token_database, tokens)
+
+    descriptors = build_stored_block_metadata(
+        token_database,
+        tokens,
+        stored_keys=[keys[0]],
+    )
+
+    assert len(descriptors) == 1
+    assert descriptors[0].position == 0
+    assert descriptors[0].parent_hash is None
+    assert descriptors[0].token_ids == tuple(tokens[:16])
