@@ -73,6 +73,12 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
     def close(self) -> None:
         self._client.close()
 
+    def bind_instance_identity(self, metadata: LMCacheMetadata) -> None:
+        instance_id = self._client.config.lmcache_instance_id
+        if instance_id is None:
+            return
+        self._client.bind_instance_identity(instance_id, metadata.worker_id)
+
 
 class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
     """Migration plugin for GlobalKV metadata reporting and KV transfer."""
@@ -126,6 +132,8 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
         try:
             client = KvCacheClient(self.config, str(host), port)
         except Exception as exc:
+            if getattr(self.config, "globalkv_protocol", "v1") == "v2":
+                raise
             logger.warning("Failed to create GlobalKV metadata client: %s", exc)
             return None
 
@@ -140,6 +148,12 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
 
         if self._metadata_reporter is None:
             self.create_metadata_reporter()
+
+        if (
+            isinstance(self._metadata_reporter, KvCacheMetadataReporter)
+            and engine.metadata is not None
+        ):
+            self._metadata_reporter.bind_instance_identity(engine.metadata)
 
         enable_rpc_server = bool(
             self.plugin_params.get(

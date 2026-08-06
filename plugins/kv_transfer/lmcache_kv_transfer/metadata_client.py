@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from dataclasses import dataclass
 from typing import List
 
 # Third Party
 import grpc
 
-# First Party
+from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 
 try:
@@ -15,6 +16,16 @@ except ImportError as exc:
     raise ImportError(
         "GlobalKV proto modules are missing from lmcache_kv_transfer.proto"
     ) from exc
+
+logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class InstanceKey:
+    """Stable V2 identity for one distributed cache rank."""
+
+    lmcache_instance_id: str
+    worker_id: int
 
 
 class KvCacheClient:
@@ -32,6 +43,12 @@ class KvCacheClient:
         self.meta_server_port = meta_server_port
         self.channel = None
         self.stub = None
+        self.v2_capabilities_rpc = None
+        self.instance_key: InstanceKey | None = None
+        self.protocol = getattr(config, "globalkv_protocol", "v1")
+        self.rpc_timeout = float(
+            config.get_extra_config_value("globalkv_rpc_timeout_seconds", 5.0)
+        )
         
         # 数据服务器信息
         self.data_server_ip = config.kv_transfer_host
@@ -45,15 +62,59 @@ class KvCacheClient:
         self.server_id = hash(id_str) & 0xFFFFFFFF  # 转换为无符号32位整数
 
         self.connect()
-        success = self.register_instance()
-        print(f"注册实例结果: {success}\n")
+        if self.protocol in {"v1", "dual"}:
+            success = self.register_instance()
+            logger.info("GlobalKV V1 instance registration result: %s", success)
+        if self.protocol in {"dual", "v2"}:
+            self._negotiate_v2_capabilities()
     
     def connect(self):
         """建立连接到元数据服务器"""
         self.channel = grpc.insecure_channel(f'{self.meta_server_host}:{self.meta_server_port}')
-        self.stub = kvcache_pb2_grpc.KvMeta2DataStub(self.channel)
-        print(f"已连接到元数据服务器 {self.meta_server_host}:{self.meta_server_port}")
-        print(f"数据服务器ID: {self.server_id} (来自 {self.data_server_ip}:{self.data_server_http_port})")
+        if self.protocol in {"v1", "dual"}:
+            self.stub = kvcache_pb2_grpc.KvMeta2DataStub(self.channel)
+        self.v2_capabilities_rpc = self.channel.unary_unary(
+            "/kvcache.v2.KvMeta2DataV2/GetCapabilities",
+            request_serializer=lambda _request: b"",
+            response_deserializer=lambda payload: payload,
+        )
+        logger.info(
+            "Connected to GlobalKV metadata server %s:%s as legacy server id %s",
+            self.meta_server_host,
+            self.meta_server_port,
+            self.server_id,
+        )
+
+    def _negotiate_v2_capabilities(self) -> None:
+        """Probe the additive V2 service without depending on generated bindings.
+
+        The phase-A request is an empty protobuf message and the response payload
+        is intentionally opaque. Descriptor-backed V2 calls are enabled in later
+        phases after bindings have passed the cross-language checksum gate.
+        """
+        assert self.v2_capabilities_rpc is not None
+        try:
+            self.v2_capabilities_rpc(b"", timeout=self.rpc_timeout)
+        except grpc.RpcError as exc:
+            if self.protocol == "v2":
+                raise RuntimeError("GlobalKV V2 capability handshake failed") from exc
+            logger.warning(
+                "GlobalKV V2 capability handshake failed in dual mode; "
+                "V1 reporting remains active: %s",
+                exc,
+            )
+
+    def bind_instance_identity(self, lmcache_instance_id: str, worker_id: int) -> None:
+        """Bind V2 identity after LMCache engine metadata becomes available.
+
+        worker_id is the global distributed rank embedded in CacheEngineKey.
+        local_worker_id is deliberately excluded because it can repeat across hosts.
+        """
+        if not lmcache_instance_id:
+            raise ValueError("lmcache_instance_id must not be empty")
+        if worker_id < 0:
+            raise ValueError("worker_id must be non-negative")
+        self.instance_key = InstanceKey(lmcache_instance_id, worker_id)
     
     def close(self):
         """关闭连接"""

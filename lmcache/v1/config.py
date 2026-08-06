@@ -451,6 +451,15 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": 10,
         "env_converter": int,
     },
+    "globalkv_protocol": {
+        "type": str,
+        "default": "v1",
+        "env_converter": str,
+        "description": (
+            "GlobalKV control-plane protocol: v1, dual, or v2. "
+            "The default preserves the existing V1 behavior."
+        ),
+    },
     # Lazy memory allocator configurations
     "enable_lazy_memory_allocator": {
         "type": bool,
@@ -604,6 +613,16 @@ def _validate_config(self):
     if self.min_retrieve_tokens < 0:
         raise ValueError(
             "min_retrieve_tokens must be >= 0, got %d" % self.min_retrieve_tokens
+        )
+
+    if self.globalkv_protocol not in {"v1", "dual", "v2"}:
+        raise ValueError(
+            "globalkv_protocol must be one of v1, dual, v2; got %s"
+            % self.globalkv_protocol
+        )
+    if self.globalkv_protocol != "v1" and not self.lmcache_instance_id:
+        raise ValueError(
+            "lmcache_instance_id is required when globalkv_protocol is dual or v2"
         )
 
     # First Party
