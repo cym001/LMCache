@@ -11,10 +11,13 @@ import grpc
 from concurrent import futures
 from typing import Optional, List, Union
 import uuid
+import time
 
 try:
     from lmcache_kv_transfer.proto import kvserver_pb2
     from lmcache_kv_transfer.proto import kvserver_pb2_grpc
+    from lmcache_kv_transfer.proto import kvserver_v2_pb2
+    from lmcache_kv_transfer.proto import kvserver_v2_pb2_grpc
 except ImportError as exc:
     raise ImportError(
         "GlobalKV server proto modules are missing from lmcache_kv_transfer.proto"
@@ -29,6 +32,117 @@ from lmcache.v1.kv_transfer_status import (
 
 logger = init_logger(__name__)
 HashValue = Union[int, bytes]
+
+
+class LmcacheServerV2Servicer(
+    kvserver_v2_pb2_grpc.LmcacheServerV2Servicer
+):
+    """Structured copy-only transfer endpoint used by CedFs V2."""
+
+    def __init__(self, cache_engine):
+        self.cache_engine = cache_engine
+
+    def TransferKvV2(self, request, context):
+        blocks = list(request.blocks)
+        config = self.cache_engine.config
+        max_blocks = int(
+            config.get_extra_config_value("globalkv_transfer_max_blocks", 128)
+        )
+        max_tokens = int(
+            config.get_extra_config_value("globalkv_transfer_max_tokens", 32768)
+        )
+        max_bytes = int(
+            config.get_extra_config_value(
+                "globalkv_transfer_max_bytes", 4 * 1024 * 1024 * 1024
+            )
+        )
+        estimated_bytes_per_token = int(
+            config.get_extra_config_value(
+                "globalkv_transfer_estimated_bytes_per_token", 96 * 1024
+            )
+        )
+        if not request.do_copy:
+            return self._uniform_response(request, 9, "MOVE_NOT_SUPPORTED")
+        if not blocks or len(blocks) > max_blocks:
+            return self._uniform_response(request, 9, "BLOCK_LIMIT")
+        if sum(block.offset for block in blocks) > max_tokens:
+            return self._uniform_response(request, 9, "TOKEN_LIMIT")
+        if (
+            sum(block.offset for block in blocks) * estimated_bytes_per_token
+            > max_bytes
+        ):
+            return self._uniform_response(request, 9, "BYTE_LIMIT")
+        if request.deadline_unix_ms and request.deadline_unix_ms <= int(
+            time.time() * 1000
+        ):
+            return self._uniform_response(request, 6, "DEADLINE_EXPIRED")
+        if any(len(block.seq_hash) != 32 for block in blocks):
+            return self._uniform_response(request, 9, "INVALID_HASH")
+
+        plugin = getattr(self.cache_engine, "_kv_migration_plugin", None)
+        reporter = getattr(self.cache_engine, "metadata_reporter", None)
+        if plugin is None or not hasattr(plugin, "transfer_v2"):
+            return self._uniform_response(request, 9, "V2_PLUGIN_UNAVAILABLE")
+        if reporter is None:
+            return self._uniform_response(request, 9, "REPORTER_UNAVAILABLE")
+        client = getattr(reporter, "_client", None)
+        instance_key = getattr(client, "instance_key", None)
+        source_key = request.source.key
+        if (
+            instance_key is None
+            or instance_key.lmcache_instance_id
+            != source_key.lmcache_instance_id
+            or instance_key.worker_id != source_key.worker_id
+            or reporter.instance_epoch != request.source.epoch
+        ):
+            return self._uniform_response(request, 9, "STALE_SOURCE_EPOCH")
+        if reporter.compatibility_group_id != request.compatibility_group_id:
+            return self._uniform_response(request, 7, "INCOMPATIBLE_GROUP")
+        target_ip = request.target_endpoints.host
+        target_port = request.target_endpoints.nixl_init_port
+        if not target_ip or target_port <= 0:
+            return self._uniform_response(request, 9, "INVALID_TARGET")
+
+        result = plugin.transfer_v2(
+            hashes=[bytes(block.seq_hash) for block in blocks],
+            offsets=[block.offset for block in blocks],
+            old_position="LocalCPUBackend",
+            peer_ip=target_ip,
+            peer_init_port=target_port,
+            event_id=request.transfer_id or str(uuid.uuid4()),
+            token_ids=[token for block in blocks for token in block.token_ids],
+            compatibility_group_id=bytes(request.compatibility_group_id),
+            expected_target_epoch=request.target.epoch,
+            expected_target_instance_id=request.target.key.lmcache_instance_id,
+            expected_target_worker_id=request.target.key.worker_id,
+        )
+        return kvserver_v2_pb2.TransferKvV2Response(
+            transfer_id=request.transfer_id,
+            results=[
+                kvserver_v2_pb2.BlockTransferResultV2(
+                    seq_hash=block_result.seq_hash,
+                    status=int(block_result.status),
+                    target_replica_version=block_result.target_replica_version,
+                    bytes_transferred=block_result.bytes_transferred,
+                    error_detail_code=block_result.error_detail_code,
+                )
+                for block_result in result.block_results
+            ],
+        )
+
+    @staticmethod
+    def _uniform_response(request, status: int, detail: str):
+        return kvserver_v2_pb2.TransferKvV2Response(
+            transfer_id=request.transfer_id,
+            results=[
+                kvserver_v2_pb2.BlockTransferResultV2(
+                    seq_hash=block.seq_hash,
+                    status=status,
+                    error_detail_code=detail,
+                )
+                for block in request.blocks
+            ],
+        )
 
 
 class LmcacheServerServicer(kvserver_pb2_grpc.LmcacheServerServicer):
@@ -307,6 +421,9 @@ class GlobalKvServer:
         # Create and register the servicer
         servicer = LmcacheServerServicer(self.cache_engine)
         kvserver_pb2_grpc.add_LmcacheServerServicer_to_server(servicer, self.server)
+        kvserver_v2_pb2_grpc.add_LmcacheServerV2Servicer_to_server(
+            LmcacheServerV2Servicer(self.cache_engine), self.server
+        )
         
         # Bind to the specified address and verify binding succeeded
         try:
@@ -451,4 +568,3 @@ if __name__ == "__main__":
     print("3. Blocking mode:")
     print("   from lmcache.v1.remote.server import serve")
     print("   serve(cache_engine, blocking=True)  # Blocks until terminated")
-

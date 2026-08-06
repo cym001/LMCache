@@ -18,6 +18,8 @@ from lmcache.v1.kv_transfer_status import (
 
 from lmcache_kv_transfer.backend import (
     KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+    KvTransferBlockResult,
+    KvTransferBlockStatus,
     KvTransferPeerResult,
 )
 from lmcache_kv_transfer.migration import GlobalKvMigrationPlugin, _KvTransferJob
@@ -64,9 +66,12 @@ def _make_plugin_with_engine(
     transfer_future: Future[KvTransferPeerResult] = Future()
     transfer_future.set_result(
         KvTransferPeerResult(
-            num_read_chunks=1,
-            num_existing_chunks=0,
-            num_requested_chunks=1,
+            block_results=(
+                KvTransferBlockResult(
+                    seq_hash=(101).to_bytes(32, "big"),
+                    status=KvTransferBlockStatus.COPIED,
+                ),
+            ),
         )
     )
     monkeypatch.setattr(
@@ -164,9 +169,16 @@ def test_execute_kv_transfer_passes_full_sequence_put_metadata(
     transfer_future: Future[KvTransferPeerResult] = Future()
     transfer_future.set_result(
         KvTransferPeerResult(
-            num_read_chunks=1,
-            num_existing_chunks=0,
-            num_requested_chunks=2,
+            block_results=(
+                KvTransferBlockResult(
+                    seq_hash=(101).to_bytes(32, "big"),
+                    status=KvTransferBlockStatus.COPIED,
+                ),
+                KvTransferBlockResult(
+                    seq_hash=(202).to_bytes(32, "big"),
+                    status=KvTransferBlockStatus.NOT_ATTEMPTED,
+                ),
+            ),
         )
     )
     monkeypatch.setattr(
@@ -186,10 +198,14 @@ def test_execute_kv_transfer_passes_full_sequence_put_metadata(
         event_id="evt",
         do_copy=True,
         token_ids=list(range(32)),
+        compatibility_group_id=b"",
+        expected_target_epoch="",
+        expected_target_instance_id="",
+        expected_target_worker_id=-1,
         result=Future(),
     )
 
-    assert plugin._execute_kv_transfer_job(job) == 16
+    assert plugin._execute_kv_transfer_job(job).num_satisfied_chunks == 1
 
     kwargs = kv_backend.transfer_to_peer.call_args.kwargs
     assert kwargs["hashes"] == [101, 202]
@@ -206,9 +222,12 @@ def test_kv_transfer_returns_already_satisfied_status(
     transfer_future: Future[KvTransferPeerResult] = Future()
     transfer_future.set_result(
         KvTransferPeerResult(
-            num_read_chunks=0,
-            num_existing_chunks=1,
-            num_requested_chunks=1,
+            block_results=(
+                KvTransferBlockResult(
+                    seq_hash=(101).to_bytes(32, "big"),
+                    status=KvTransferBlockStatus.ALREADY_PRESENT,
+                ),
+            ),
         )
     )
     monkeypatch.setattr(

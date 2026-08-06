@@ -44,10 +44,13 @@ class KvMetadataReporterInterface(ABC):
     def on_kv_stored(self, tokens: list[int]) -> None:
         """Report tokens stored into the local cache."""
 
-    def on_kv_stored_structured(self, blocks: list[KvBlockMetadata]) -> None:
+    def on_kv_stored_structured(
+        self, blocks: list[KvBlockMetadata]
+    ) -> dict[bytes, int]:
         """Report exact stored chunks, with a V1-compatible default adapter."""
         tokens = [token for block in blocks for token in block.token_ids]
         self.on_kv_stored(tokens)
+        return {}
 
     @abstractmethod
     def on_kv_retrieved(self, hit_tokens: list[int]) -> None:

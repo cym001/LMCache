@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, TypeAlias, Union
 import asyncio
 import time
@@ -64,6 +65,27 @@ ChunkHash: TypeAlias = Union[int, bytes]
 KV_TRANSFER_MEM_INDEX_UNAVAILABLE = -1
 
 
+class KvTransferBlockStatus(IntEnum):
+    COPIED = 1
+    ALREADY_PRESENT = 2
+    SOURCE_MISSING = 3
+    TARGET_NO_CAPACITY = 4
+    READ_FAILED = 5
+    NOT_ATTEMPTED = 6
+    INCOMPATIBLE = 7
+    STALE_TARGET_EPOCH = 8
+    PROTOCOL_ERROR = 9
+
+
+@dataclass(frozen=True)
+class KvTransferBlockResult:
+    seq_hash: bytes
+    status: KvTransferBlockStatus
+    target_replica_version: int = 0
+    bytes_transferred: int = 0
+    error_detail_code: str = ""
+
+
 class KvTransferMsgBase(msgspec.Struct, tag=True):
     """Base class for all KV transfer-related messages"""
 
@@ -123,6 +145,14 @@ class BatchedLookupAndPutMsg(KvTransferMsgBase):
     # Optional parent hash for each transferred chunk
     parent_hashes: list[ChunkHash | None] | None = None
 
+    compatibility_group_id: bytes = b""
+
+    expected_target_epoch: str = ""
+
+    expected_target_instance_id: str = ""
+
+    expected_target_worker_id: int = -1
+
 
 class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
     """Batched PUT response message"""
@@ -136,13 +166,37 @@ class BatchedLookupAndPutRetMsg(KvTransferMsgBase):
     # Number of requested chunks already present on the receiver
     num_existing_chunks: int = 0
 
+    statuses: list[int] = msgspec.field(default_factory=list)
+
+    target_replica_versions: list[int] = msgspec.field(default_factory=list)
+
+    bytes_transferred: list[int] = msgspec.field(default_factory=list)
+
+    error_detail_codes: list[str] = msgspec.field(default_factory=list)
+
 
 @dataclass(frozen=True)
 class KvTransferPeerResult:
-    num_read_chunks: int
-    num_existing_chunks: int
-    num_requested_chunks: int
+    block_results: tuple[KvTransferBlockResult, ...]
     failed: bool = False
+
+    @property
+    def num_read_chunks(self) -> int:
+        return sum(
+            result.status == KvTransferBlockStatus.COPIED
+            for result in self.block_results
+        )
+
+    @property
+    def num_existing_chunks(self) -> int:
+        return sum(
+            result.status == KvTransferBlockStatus.ALREADY_PRESENT
+            for result in self.block_results
+        )
+
+    @property
+    def num_requested_chunks(self) -> int:
+        return len(self.block_results)
 
     @property
     def num_satisfied_chunks(self) -> int:
@@ -547,6 +601,13 @@ class KvTransferBackend(StoragePluginInterface):
             offsets = msg.offsets
             token_ids = msg.token_ids
             keys = self._build_local_keys_from_hashes_offsets(hashes, offsets)
+            results = [
+                KvTransferBlockResult(
+                    seq_hash=self._chunk_hash_bytes(chunk_hash),
+                    status=KvTransferBlockStatus.NOT_ATTEMPTED,
+                )
+                for chunk_hash in hashes
+            ]
             logger.info(
                 "PUT request rebuilt %d keys from %d hashes",
                 len(keys),
@@ -562,6 +623,56 @@ class KvTransferBackend(StoragePluginInterface):
                 )
                 logger.error(error_msg)
                 raise ValueError(error_msg)
+
+            reporter = self.local_cpu_backend.metadata_reporter
+            if (
+                msg.expected_target_instance_id
+                and not getattr(reporter, "matches_instance", lambda *_: False)(
+                    msg.expected_target_instance_id,
+                    msg.expected_target_worker_id,
+                    msg.expected_target_epoch,
+                )
+            ):
+                return self._put_response(
+                    event_id,
+                    [
+                        KvTransferBlockResult(
+                            seq_hash=result.seq_hash,
+                            status=KvTransferBlockStatus.STALE_TARGET_EPOCH,
+                        )
+                        for result in results
+                    ],
+                )
+            if (
+                msg.expected_target_epoch
+                and getattr(reporter, "instance_epoch", None)
+                != msg.expected_target_epoch
+            ):
+                return self._put_response(
+                    event_id,
+                    [
+                        KvTransferBlockResult(
+                            seq_hash=result.seq_hash,
+                            status=KvTransferBlockStatus.STALE_TARGET_EPOCH,
+                        )
+                        for result in results
+                    ],
+                )
+            if (
+                msg.compatibility_group_id
+                and bytes(getattr(reporter, "compatibility_group_id", b""))
+                != msg.compatibility_group_id
+            ):
+                return self._put_response(
+                    event_id,
+                    [
+                        KvTransferBlockResult(
+                            seq_hash=result.seq_hash,
+                            status=KvTransferBlockStatus.INCOMPATIBLE,
+                        )
+                        for result in results
+                    ],
+                )
 
             # Filter out keys that already exist locally
             r_mem_indexes_to_read = []
@@ -580,11 +691,25 @@ class KvTransferBackend(StoragePluginInterface):
                             key,
                         )
                         self._remove_stale_suffix_keys(keys[idx:])
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.SOURCE_MISSING,
+                        )
                         break
 
                     if self.local_cpu_backend.contains(key, pin=False):
                         pre_existing_keys.append(key)
                         existing_chunks_count += 1
+                        version = 0
+                        if reporter is not None and hasattr(reporter, "replica_version"):
+                            version = int(
+                                reporter.replica_version(results[idx].seq_hash) or 0
+                            )
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.ALREADY_PRESENT,
+                            target_replica_version=version,
+                        )
                         logger.debug(f"Key {key} already exists locally, skipping")
                         continue
 
@@ -603,6 +728,10 @@ class KvTransferBackend(StoragePluginInterface):
                             "skipping remaining chunks in this batch",
                             key,
                         )
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.TARGET_NO_CAPACITY,
+                        )
                         break
 
                     r_mem_indexes_to_read.append(r_mem_indexes[idx])
@@ -611,21 +740,41 @@ class KvTransferBackend(StoragePluginInterface):
                     offsets_to_read.append(offsets[idx])
 
                 # Receive data from the sending peer node
-                if keys_to_read:
-                    channel_transfer_spec = {
-                        "sender_id": sender_id,
-                        "remote_indexes": r_mem_indexes_to_read,
-                    }
-                    await self.transfer_channel.async_batched_read(
-                        buffers=local_mem_objs,
-                        transfer_spec=channel_transfer_spec,
-                    )
+                try:
+                    if keys_to_read:
+                        channel_transfer_spec = {
+                            "sender_id": sender_id,
+                            "remote_indexes": r_mem_indexes_to_read,
+                        }
+                        await self.transfer_channel.async_batched_read(
+                            buffers=local_mem_objs,
+                            transfer_spec=channel_transfer_spec,
+                        )
+                except Exception as exc:
+                    for key in keys_to_read:
+                        idx = keys.index(key)
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.READ_FAILED,
+                            error_detail_code=type(exc).__name__,
+                        )
+                    return self._put_response(event_id, results)
 
                 # Store received data in local backend
-                self.local_cpu_backend.batched_submit_put_task(
-                    keys=keys_to_read,
-                    memory_objs=local_mem_objs,
-                )
+                try:
+                    self.local_cpu_backend.batched_submit_put_task(
+                        keys=keys_to_read,
+                        memory_objs=local_mem_objs,
+                    )
+                except Exception as exc:
+                    for key in keys_to_read:
+                        idx = keys.index(key)
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.READ_FAILED,
+                            error_detail_code=f"STORE_{type(exc).__name__}",
+                        )
+                    return self._put_response(event_id, results)
 
                 logger.info(
                     "KV transfer PUT satisfied %d/%d chunks "
@@ -638,7 +787,7 @@ class KvTransferBackend(StoragePluginInterface):
                 )
 
                 # Publish KV store events only for newly migrated chunks.
-                self._publish_migrated_kv_store_events(
+                versions = self._publish_migrated_kv_store_events(
                     migrated_keys=keys_to_read,
                     pre_existing_keys=pre_existing_keys,
                     token_ids=token_ids,
@@ -647,11 +796,24 @@ class KvTransferBackend(StoragePluginInterface):
                     report_metadata=True,
                 )
 
-                return BatchedLookupAndPutRetMsg(
-                    event_id=event_id,
-                    num_read_chunks=len(local_mem_objs),
-                    num_existing_chunks=existing_chunks_count,
-                )
+                for key, memory_obj in zip(keys_to_read, local_mem_objs, strict=False):
+                    idx = keys.index(key)
+                    if self.local_cpu_backend.contains(key, pin=False):
+                        seq_hash = results[idx].seq_hash
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=seq_hash,
+                            status=KvTransferBlockStatus.COPIED,
+                            target_replica_version=versions.get(seq_hash, 0),
+                            bytes_transferred=memory_obj.get_size(),
+                        )
+                    else:
+                        results[idx] = KvTransferBlockResult(
+                            seq_hash=results[idx].seq_hash,
+                            status=KvTransferBlockStatus.READ_FAILED,
+                            error_detail_code="STORE_NOT_VISIBLE",
+                        )
+
+                return self._put_response(event_id, results)
             finally:
                 for mem_obj in local_mem_objs:
                     mem_obj.ref_count_down()
@@ -679,6 +841,34 @@ class KvTransferBackend(StoragePluginInterface):
         )
         return keys
 
+    @staticmethod
+    def _chunk_hash_bytes(chunk_hash: ChunkHash) -> bytes:
+        if isinstance(chunk_hash, int):
+            return (chunk_hash & ((1 << 256) - 1)).to_bytes(32, "big")
+        return bytes(chunk_hash).rjust(32, b"\x00")[-32:]
+
+    @staticmethod
+    def _put_response(
+        event_id: str,
+        results: list[KvTransferBlockResult],
+    ) -> BatchedLookupAndPutRetMsg:
+        return BatchedLookupAndPutRetMsg(
+            event_id=event_id,
+            num_read_chunks=sum(
+                result.status == KvTransferBlockStatus.COPIED for result in results
+            ),
+            num_existing_chunks=sum(
+                result.status == KvTransferBlockStatus.ALREADY_PRESENT
+                for result in results
+            ),
+            statuses=[int(result.status) for result in results],
+            target_replica_versions=[
+                result.target_replica_version for result in results
+            ],
+            bytes_transferred=[result.bytes_transferred for result in results],
+            error_detail_codes=[result.error_detail_code for result in results],
+        )
+
     def _remove_stale_suffix_keys(self, keys: Sequence[CacheEngineKey]) -> int:
         """Remove suffix chunks that remain locally after a source prefix gap."""
         keys_to_remove = [
@@ -704,26 +894,30 @@ class KvTransferBackend(StoragePluginInterface):
         offsets: list[int],
         event_id: str,
         report_metadata: bool = False,
-    ) -> None:
+    ) -> dict[bytes, int]:
         """Publish store events only for newly migrated chunks."""
         if not migrated_keys or not token_ids:
-            return
+            return {}
 
         if not validate_full_sequence_token_ids(token_ids, offsets, event_id):
-            return
+            return {}
 
         pre_existing_hashes = {key.chunk_hash for key in pre_existing_keys}
+        versions: dict[bytes, int] = {}
         if report_metadata and self.local_cpu_backend.metadata_reporter is not None:
             descriptors = build_stored_block_metadata(
                 self.token_database,
                 token_ids,
                 migrated_keys,
             )
-            self.local_cpu_backend.metadata_reporter.on_kv_stored_structured(
-                descriptors
+            versions = (
+                self.local_cpu_backend.metadata_reporter.on_kv_stored_structured(
+                    descriptors
+                )
+                or {}
             )
         if self.kv_events is None:
-            return
+            return versions
         for event in build_migrated_store_events(
             self.token_database,
             token_ids,
@@ -735,6 +929,7 @@ class KvTransferBackend(StoragePluginInterface):
                 event,
             )
             self.kv_events.append(event)
+        return versions
 
     async def _ensure_peer_connection(
         self,
@@ -1212,6 +1407,10 @@ class KvTransferBackend(StoragePluginInterface):
         token_ids: Optional[List[int]] = None,
         parent_hashes: Optional[List[ChunkHash | None]] = None,
         mem_indexes: Optional[List[int]] = None,
+        compatibility_group_id: bytes = b"",
+        expected_target_epoch: str = "",
+        expected_target_instance_id: str = "",
+        expected_target_worker_id: int = -1,
     ) -> KvTransferPeerResult:
         """
         Transfer KV cache data to a specific peer node.
@@ -1246,6 +1445,10 @@ class KvTransferBackend(StoragePluginInterface):
             "token_ids": token_ids,
             "parent_hashes": parent_hashes,
             "mem_indexes": mem_indexes,
+            "compatibility_group_id": compatibility_group_id,
+            "expected_target_epoch": expected_target_epoch,
+            "expected_target_instance_id": expected_target_instance_id,
+            "expected_target_worker_id": expected_target_worker_id,
         }
         
         return await self.async_batched_submit_put_task(
@@ -1286,6 +1489,14 @@ class KvTransferBackend(StoragePluginInterface):
         token_ids = transfer_spec.get("token_ids")
         parent_hashes = transfer_spec.get("parent_hashes")
         mem_indexes = transfer_spec.get("mem_indexes")
+        compatibility_group_id = transfer_spec.get("compatibility_group_id", b"")
+        expected_target_epoch = transfer_spec.get("expected_target_epoch", "")
+        expected_target_instance_id = transfer_spec.get(
+            "expected_target_instance_id", ""
+        )
+        expected_target_worker_id = transfer_spec.get(
+            "expected_target_worker_id", -1
+        )
 
         # Establish connection to target peer (reuses existing connection if available)
         await self._ensure_peer_connection(peer_init_url)
@@ -1306,6 +1517,10 @@ class KvTransferBackend(StoragePluginInterface):
             token_ids=token_ids,
             parent_hashes=parent_hashes,
             mem_indexes=list(mem_indexes),
+            compatibility_group_id=compatibility_group_id,
+            expected_target_epoch=expected_target_epoch,
+            expected_target_instance_id=expected_target_instance_id,
+            expected_target_worker_id=expected_target_worker_id,
         )
 
         # Update last used time and move to end (most recently used)
@@ -1321,11 +1536,47 @@ class KvTransferBackend(StoragePluginInterface):
         try:
             # Lock-free concurrent request using event_id for correlation
             ret_msg = await self._send_request_and_wait(peer_init_url, event_id, msg)
-            
+
+            if not ret_msg.statuses and not compatibility_group_id:
+                ret_msg.statuses = (
+                    [int(KvTransferBlockStatus.ALREADY_PRESENT)]
+                    * ret_msg.num_existing_chunks
+                    + [int(KvTransferBlockStatus.COPIED)]
+                    * ret_msg.num_read_chunks
+                )[: len(hashes)]
+                ret_msg.statuses.extend(
+                    [int(KvTransferBlockStatus.NOT_ATTEMPTED)]
+                    * (len(hashes) - len(ret_msg.statuses))
+                )
+                ret_msg.target_replica_versions = [0] * len(hashes)
+                ret_msg.bytes_transferred = [0] * len(hashes)
+                ret_msg.error_detail_codes = [""] * len(hashes)
+            if not (
+                len(ret_msg.statuses)
+                == len(ret_msg.target_replica_versions)
+                == len(ret_msg.bytes_transferred)
+                == len(ret_msg.error_detail_codes)
+                == len(hashes)
+            ):
+                raise ValueError("PUT response does not contain one result per hash")
             result = KvTransferPeerResult(
-                num_read_chunks=ret_msg.num_read_chunks,
-                num_existing_chunks=ret_msg.num_existing_chunks,
-                num_requested_chunks=len(hashes),
+                block_results=tuple(
+                    KvTransferBlockResult(
+                        seq_hash=self._chunk_hash_bytes(chunk_hash),
+                        status=KvTransferBlockStatus(status),
+                        target_replica_version=version,
+                        bytes_transferred=byte_count,
+                        error_detail_code=error_code,
+                    )
+                    for chunk_hash, status, version, byte_count, error_code in zip(
+                        hashes,
+                        ret_msg.statuses,
+                        ret_msg.target_replica_versions,
+                        ret_msg.bytes_transferred,
+                        ret_msg.error_detail_codes,
+                        strict=True,
+                    )
+                )
             )
             logger.info(
                 "Peer %s satisfied %d/%d chunks "
@@ -1344,9 +1595,14 @@ class KvTransferBackend(StoragePluginInterface):
                 f"Transfer aborted."
             )
             return KvTransferPeerResult(
-                num_read_chunks=0,
-                num_existing_chunks=0,
-                num_requested_chunks=len(hashes),
+                block_results=tuple(
+                    KvTransferBlockResult(
+                        seq_hash=self._chunk_hash_bytes(chunk_hash),
+                        status=KvTransferBlockStatus.READ_FAILED,
+                        error_detail_code=type(e).__name__,
+                    )
+                    for chunk_hash in hashes
+                ),
                 failed=True,
             )
 

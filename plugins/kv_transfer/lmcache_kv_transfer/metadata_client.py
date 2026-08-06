@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import List
 import os
+import threading
 import uuid
 
 # Third Party
@@ -62,6 +63,7 @@ class KvCacheClient:
         self.compatibility_group_id = b""
         self.lease_id = ""
         self.event_seq = 0
+        self._mutation_lock = threading.Lock()
         self.protocol = getattr(config, "globalkv_protocol", "v1")
         self.rpc_timeout = float(
             config.get_extra_config_value("globalkv_rpc_timeout_seconds", 5.0)
@@ -235,9 +237,9 @@ class KvCacheClient:
             logger.warning("GlobalKV V2 registration failed; V1 remains active: %s", exc)
             self.v2_stub = None
 
-    def report_stored_blocks(self, blocks: list[KvBlockMetadata]) -> None:
+    def report_stored_blocks(self, blocks: list[KvBlockMetadata]) -> int:
         if not blocks or self.v2_stub is None:
-            return
+            return 0
         proto_blocks = [
             kvcache_v2_pb2.BlockDescriptorV2(
                 seq_hash=block.seq_hash,
@@ -248,16 +250,22 @@ class KvCacheClient:
             )
             for block in blocks
         ]
-        self._report_mutation(store=kvcache_v2_pb2.StoreBlocksV2(blocks=proto_blocks))
+        return self._report_mutation(
+            store=kvcache_v2_pb2.StoreBlocksV2(blocks=proto_blocks)
+        )
 
-    def report_removed_blocks(self, seq_hashes: list[bytes]) -> None:
+    def report_removed_blocks(self, seq_hashes: list[bytes]) -> int:
         if not seq_hashes or self.v2_stub is None:
-            return
-        self._report_mutation(
+            return 0
+        return self._report_mutation(
             remove=kvcache_v2_pb2.RemoveBlocksV2(seq_hashes=seq_hashes)
         )
 
-    def _report_mutation(self, **payload) -> None:
+    def _report_mutation(self, **payload) -> int:
+        with self._mutation_lock:
+            return self._report_mutation_locked(**payload)
+
+    def _report_mutation_locked(self, **payload) -> int:
         assert self.instance_key is not None
         self.event_seq += 1
         identity = kvcache_v2_pb2.InstanceIdentityV2(
@@ -294,10 +302,12 @@ class KvCacheClient:
                     "GlobalKV V2 mutation rejected: "
                     f"status={response.status} detail={response.error_detail}"
                 )
+            return int(response.committed_through_seq)
         except (grpc.RpcError, RuntimeError) as exc:
             if self.protocol == "v2":
                 raise
             logger.warning("GlobalKV V2 shadow mutation failed: %s", exc)
+            return 0
     
     def close(self):
         """关闭连接"""

@@ -26,7 +26,12 @@ from lmcache.v1.plugin.kv_migration import (
     find_kv_transfer_backend,
 )
 
-from lmcache_kv_transfer.backend import KV_TRANSFER_MEM_INDEX_UNAVAILABLE
+from lmcache_kv_transfer.backend import (
+    KV_TRANSFER_MEM_INDEX_UNAVAILABLE,
+    KvTransferBlockResult,
+    KvTransferBlockStatus,
+    KvTransferPeerResult,
+)
 from lmcache_kv_transfer.globalkv_server import GlobalKvServer
 from lmcache_kv_transfer.metadata_client import KvCacheClient
 
@@ -39,7 +44,7 @@ logger = init_logger(__name__)
 
 @dataclass
 class _KvTransferJob:
-    hashes: List[int]
+    hashes: List[int | bytes]
     offsets: List[int]
     old_position: str
     peer_ip: str
@@ -47,7 +52,11 @@ class _KvTransferJob:
     event_id: str
     do_copy: bool
     token_ids: Optional[List[int]]
-    result: Future[int]
+    compatibility_group_id: bytes
+    expected_target_epoch: str
+    expected_target_instance_id: str
+    expected_target_worker_id: int
+    result: Future[KvTransferPeerResult]
 
 
 class KvCacheMetadataReporter(KvMetadataReporterInterface):
@@ -56,15 +65,18 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
     def __init__(self, client: KvCacheClient) -> None:
         self._client = client
         self._ledger: dict[bytes, KvBlockMetadata] = {}
+        self._replica_versions: dict[bytes, int] = {}
         self._ledger_lock = threading.Lock()
 
     def on_kv_stored(self, tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
             self._client.upload_kv_meta(tokens)
 
-    def on_kv_stored_structured(self, blocks: list[KvBlockMetadata]) -> None:
+    def on_kv_stored_structured(
+        self, blocks: list[KvBlockMetadata]
+    ) -> dict[bytes, int]:
         if not blocks:
-            return
+            return {}
         with self._ledger_lock:
             for block in blocks:
                 self._ledger[block.seq_hash] = block
@@ -72,8 +84,19 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
             self._client.upload_kv_meta(
                 [token for block in blocks for token in block.token_ids]
             )
+        version = 0
         if self._client.protocol in {"dual", "v2"}:
-            self._client.report_stored_blocks(blocks)
+            version = self._client.report_stored_blocks(blocks)
+        with self._ledger_lock:
+            if version > 0:
+                for block in blocks:
+                    self._replica_versions[block.seq_hash] = max(
+                        version, self._replica_versions.get(block.seq_hash, 0)
+                    )
+            return {
+                block.seq_hash: self._replica_versions.get(block.seq_hash, 0)
+                for block in blocks
+            }
 
     def on_kv_retrieved(self, hit_tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
@@ -86,7 +109,13 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
         if self._client.protocol in {"v1", "dual"}:
             self._client.remove_kv_meta(chunk_hashes)
         if self._client.protocol in {"dual", "v2"}:
-            self._client.report_removed_blocks(chunk_hashes)
+            version = self._client.report_removed_blocks(chunk_hashes)
+            if version > 0:
+                with self._ledger_lock:
+                    for chunk_hash in chunk_hashes:
+                        self._replica_versions[chunk_hash] = max(
+                            version, self._replica_versions.get(chunk_hash, 0)
+                        )
 
     def on_request_start(self, request_id: str, tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
@@ -102,6 +131,29 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
     def ledger_snapshot(self) -> dict[bytes, KvBlockMetadata]:
         with self._ledger_lock:
             return dict(self._ledger)
+
+    def replica_version(self, seq_hash: bytes) -> int:
+        with self._ledger_lock:
+            return self._replica_versions.get(seq_hash, 0)
+
+    @property
+    def instance_epoch(self) -> str:
+        return self._client.instance_epoch
+
+    @property
+    def compatibility_group_id(self) -> bytes:
+        return self._client.compatibility_group_id
+
+    def matches_instance(
+        self, instance_id: str, worker_id: int, epoch: str
+    ) -> bool:
+        key = self._client.instance_key
+        return (
+            key is not None
+            and key.lmcache_instance_id == instance_id
+            and key.worker_id == worker_id
+            and self._client.instance_epoch == epoch
+        )
 
     def bind_instance_identity(self, metadata: LMCacheMetadata) -> None:
         instance_id = self._client.config.lmcache_instance_id
@@ -256,9 +308,114 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             event_id=event_id,
             do_copy=do_copy,
             token_ids=token_ids,
+            compatibility_group_id=b"",
+            expected_target_epoch="",
+            expected_target_instance_id="",
+            expected_target_worker_id=-1,
             result=Future(),
         )
-        return self._submit_kv_transfer_job(job)
+        result = self._submit_kv_transfer_job(job)
+        if result.all_already_satisfied:
+            return KV_TRANSFER_ALREADY_SATISFIED
+        if result.num_satisfied_chunks == 0:
+            if result.block_results and result.block_results[0].status == (
+                KvTransferBlockStatus.SOURCE_MISSING
+            ):
+                return KV_TRANSFER_NOT_FOUND
+            return KV_TRANSFER_FAILED
+        return sum(
+            offset
+            for offset, block_result in zip(
+                offsets, result.block_results, strict=False
+            )
+            if block_result.status
+            in {
+                KvTransferBlockStatus.COPIED,
+                KvTransferBlockStatus.ALREADY_PRESENT,
+            }
+        )
+
+    def transfer_v2(
+        self,
+        *,
+        hashes: list[bytes],
+        offsets: list[int],
+        old_position: str,
+        peer_ip: str,
+        peer_init_port: int,
+        event_id: str,
+        token_ids: list[int] | None,
+        compatibility_group_id: bytes,
+        expected_target_epoch: str,
+        expected_target_instance_id: str,
+        expected_target_worker_id: int,
+    ) -> KvTransferPeerResult:
+        if self._migration_worker_shutdown:
+            return self._failure_result(hashes, "WORKER_STOPPED")
+        return self._submit_kv_transfer_job(
+            _KvTransferJob(
+                hashes=hashes,
+                offsets=offsets,
+                old_position=old_position,
+                peer_ip=peer_ip,
+                peer_init_port=peer_init_port,
+                event_id=event_id,
+                do_copy=True,
+                token_ids=token_ids,
+                compatibility_group_id=compatibility_group_id,
+                expected_target_epoch=expected_target_epoch,
+                expected_target_instance_id=expected_target_instance_id,
+                expected_target_worker_id=expected_target_worker_id,
+                result=Future(),
+            )
+        )
+
+    @staticmethod
+    def _failure_result(
+        hashes: list[int] | list[bytes],
+        detail: str,
+        status: KvTransferBlockStatus = KvTransferBlockStatus.READ_FAILED,
+    ) -> KvTransferPeerResult:
+        return KvTransferPeerResult(
+            block_results=tuple(
+                KvTransferBlockResult(
+                    seq_hash=(
+                        chunk_hash.to_bytes(32, "big")
+                        if isinstance(chunk_hash, int)
+                        else bytes(chunk_hash)
+                    ),
+                    status=status,
+                    error_detail_code=detail,
+                )
+                for chunk_hash in hashes
+            ),
+            failed=True,
+        )
+
+    @staticmethod
+    def _hash_bytes(chunk_hash: int | bytes) -> bytes:
+        if isinstance(chunk_hash, int):
+            return (chunk_hash & ((1 << 256) - 1)).to_bytes(32, "big")
+        return bytes(chunk_hash).rjust(32, b"\x00")[-32:]
+
+    def _source_missing_result(
+        self, hashes: list[int | bytes]
+    ) -> KvTransferPeerResult:
+        return KvTransferPeerResult(
+            block_results=tuple(
+                KvTransferBlockResult(
+                    seq_hash=self._hash_bytes(chunk_hash),
+                    status=(
+                        KvTransferBlockStatus.SOURCE_MISSING
+                        if index == 0
+                        else KvTransferBlockStatus.NOT_ATTEMPTED
+                    ),
+                    error_detail_code="SOURCE_MISSING",
+                )
+                for index, chunk_hash in enumerate(hashes)
+            ),
+            failed=True,
+        )
 
     def _wait_for_foreground_idle(self) -> bool:
         engine = self._engine
@@ -276,18 +433,22 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
                 if job is None:
                     return
                 if not self._wait_for_foreground_idle():
-                    job.result.set_result(KV_TRANSFER_FAILED)
+                    job.result.set_result(
+                        self._failure_result(job.hashes, "WORKER_STOPPED")
+                    )
                     continue
                 result = self._execute_kv_transfer_job(job)
                 job.result.set_result(result)
             except Exception as exc:
                 logger.error("KV transfer worker failed: %s", exc, exc_info=True)
                 if job is not None:
-                    job.result.set_result(KV_TRANSFER_FAILED)
+                    job.result.set_result(
+                        self._failure_result(job.hashes, type(exc).__name__)
+                    )
             finally:
                 self._migration_queue.task_done()
 
-    def _submit_kv_transfer_job(self, job: _KvTransferJob) -> int:
+    def _submit_kv_transfer_job(self, job: _KvTransferJob) -> KvTransferPeerResult:
         self._migration_queue.put(job)
         return job.result.result()
 
@@ -312,14 +473,18 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
                 except queue.Empty:
                     continue
                 if pending_job is not None:
-                    pending_job.result.set_result(KV_TRANSFER_FAILED)
+                    pending_job.result.set_result(
+                        self._failure_result(
+                            pending_job.hashes, "WORKER_STOPPED"
+                        )
+                    )
                 self._migration_queue.task_done()
         worker.join(timeout=1.0)
 
-    def _execute_kv_transfer_job(self, job: _KvTransferJob) -> int:
+    def _execute_kv_transfer_job(self, job: _KvTransferJob) -> KvTransferPeerResult:
         engine = self._engine
         if engine is None or engine.storage_manager is None:
-            return KV_TRANSFER_FAILED
+            return self._failure_result(job.hashes, "ENGINE_UNAVAILABLE")
 
         memory_objs: list[MemoryObj | None] | None = None
         num_tokens = engine.lookup(
@@ -329,12 +494,25 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             lookup_id=job.event_id,
             pin=True,
         )
+        if not num_tokens and any(isinstance(value, bytes) for value in job.hashes):
+            num_tokens = engine.lookup(
+                hashes=[
+                    int.from_bytes(value, "big")
+                    if isinstance(value, bytes)
+                    else value
+                    for value in job.hashes
+                ],
+                offsets=job.offsets,
+                search_range=[job.old_position],
+                lookup_id=job.event_id,
+                pin=True,
+            )
 
         if not num_tokens:
             logger.info(
                 "KV transfer is not performed as there are no tokens to transfer."
             )
-            return KV_TRANSFER_NOT_FOUND
+            return self._source_missing_result(job.hashes)
 
         try:
             block_mapping = engine.lookup_pins[job.event_id]
@@ -345,7 +523,7 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
                     "in %s.",
                     job.old_position,
                 )
-                return KV_TRANSFER_NOT_FOUND
+                return self._source_missing_result(job.hashes)
 
             memory_objs = engine.storage_manager.batched_get(
                 keys=keys,
@@ -353,7 +531,7 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             )
             if memory_objs is None or any(obj is None for obj in memory_objs):
                 logger.error("Failed to get memory objects to transfer")
-                return KV_TRANSFER_FAILED
+                return self._failure_result(job.hashes, "SOURCE_READ_FAILED")
 
             transfer_objs = [obj for obj in memory_objs if obj is not None]
             logger.info(
@@ -366,22 +544,23 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             kv_transfer_backend = find_kv_transfer_backend(engine.storage_manager)
             if kv_transfer_backend is None:
                 logger.error("KvTransferBackend is not available in storage backends")
-                return KV_TRANSFER_FAILED
+                return self._failure_result(job.hashes, "BACKEND_UNAVAILABLE")
 
             hash_to_mem_index: dict[Any, int] = {}
             local_indexes = kv_transfer_backend.transfer_channel.get_local_mem_indices(
                 transfer_objs
             )
             for key, mem_index in zip(keys, local_indexes, strict=False):
-                hash_to_mem_index[key.chunk_hash] = mem_index
+                hash_to_mem_index[self._hash_bytes(key.chunk_hash)] = mem_index
 
             full_mem_indexes: list[int] = []
             source_prefix_broken = False
             for chunk_hash in job.hashes:
+                normalized_hash = self._hash_bytes(chunk_hash)
                 if source_prefix_broken:
                     full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
-                elif chunk_hash in hash_to_mem_index:
-                    full_mem_indexes.append(hash_to_mem_index[chunk_hash])
+                elif normalized_hash in hash_to_mem_index:
+                    full_mem_indexes.append(hash_to_mem_index[normalized_hash])
                 else:
                     full_mem_indexes.append(KV_TRANSFER_MEM_INDEX_UNAVAILABLE)
                     source_prefix_broken = True
@@ -397,24 +576,23 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
                         event_id=job.event_id,
                         token_ids=job.token_ids,
                         mem_indexes=full_mem_indexes,
+                        compatibility_group_id=job.compatibility_group_id,
+                        expected_target_epoch=job.expected_target_epoch,
+                        expected_target_instance_id=job.expected_target_instance_id,
+                        expected_target_worker_id=job.expected_target_worker_id,
                     ),
                     engine.storage_manager.loop,
                 )
                 transfer_result = future.result()
-                num_satisfied = transfer_result.num_satisfied_chunks
-                transfer_status = num_tokens
-
-                if num_satisfied != len(job.hashes):
+                if transfer_result.num_satisfied_chunks != len(job.hashes):
                     logger.warning(
                         "Only %d/%d chunks were satisfied by peer "
                         "(%d newly read, %d already existed)",
-                        num_satisfied,
+                        transfer_result.num_satisfied_chunks,
                         len(job.hashes),
                         transfer_result.num_read_chunks,
                         transfer_result.num_existing_chunks,
                     )
-                    if num_satisfied == 0:
-                        return KV_TRANSFER_FAILED
                 elif transfer_result.all_already_satisfied:
                     logger.info(
                         "KV transfer already satisfied: peer %s:%s already "
@@ -423,12 +601,9 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
                         job.peer_init_port,
                         len(keys),
                     )
-                    transfer_status = KV_TRANSFER_ALREADY_SATISFIED
-                else:
-                    transfer_status = num_tokens
             except Exception as exc:
                 logger.error("KV transfer failed with exception: %s", exc)
-                return KV_TRANSFER_FAILED
+                return self._failure_result(job.hashes, type(exc).__name__)
 
             if not job.do_copy:
                 engine.lookup_unpin(job.event_id)
@@ -443,12 +618,12 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
 
             logger.info(
                 "KV transfer completed: status=%s from %s to peer %s:%s",
-                transfer_status,
+                transfer_result.num_satisfied_chunks,
                 job.old_position,
                 job.peer_ip,
                 job.peer_init_port,
             )
-            return transfer_status
+            return transfer_result
         finally:
             engine.lookup_unpin(job.event_id)
             if memory_objs is not None:
