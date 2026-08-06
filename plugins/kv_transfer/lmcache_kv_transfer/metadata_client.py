@@ -2,8 +2,10 @@
 # Standard
 from dataclasses import dataclass
 from typing import List
+import hashlib
 import os
 import threading
+import time
 import uuid
 
 # Third Party
@@ -64,6 +66,10 @@ class KvCacheClient:
         self.lease_id = ""
         self.event_seq = 0
         self._mutation_lock = threading.Lock()
+        self.meta_generation = ""
+        self.lease_ttl_ms = 0
+        self.sync_required = False
+        self._metadata: LMCacheMetadata | None = None
         self.protocol = getattr(config, "globalkv_protocol", "v1")
         self.rpc_timeout = float(
             config.get_extra_config_value("globalkv_rpc_timeout_seconds", 5.0)
@@ -125,7 +131,13 @@ class KvCacheClient:
             local_digest = v2_descriptor_sha256()
             if bytes(response.descriptor_sha256) != local_digest:
                 raise RuntimeError("GlobalKV V2 descriptor checksum mismatch")
-        except (grpc.RpcError, RuntimeError) as exc:
+        except grpc.RpcError as exc:
+            self.sync_required = True
+            logger.warning(
+                "GlobalKV V2 capability handshake is temporarily unavailable: %s",
+                exc,
+            )
+        except RuntimeError as exc:
             if self.protocol == "v2":
                 raise RuntimeError("GlobalKV V2 capability handshake failed") from exc
             logger.warning(
@@ -150,6 +162,7 @@ class KvCacheClient:
         if metadata.worker_id < 0:
             raise ValueError("worker_id must be non-negative")
         self.instance_key = InstanceKey(lmcache_instance_id, metadata.worker_id)
+        self._metadata = metadata
         if self.protocol in {"dual", "v2"}:
             self._register_instance_v2(metadata)
 
@@ -221,6 +234,7 @@ class KvCacheClient:
                 api_path="/v1",
             ),
             fingerprint=fingerprint,
+            known_meta_generation=self.meta_generation,
         )
         try:
             response = self.v2_stub.RegisterInstance(
@@ -231,7 +245,13 @@ class KvCacheClient:
                 raise RuntimeError(f"GlobalKV V2 registration rejected: {response.error_detail}")
             self.compatibility_group_id = bytes(response.compatibility_group_id)
             self.lease_id = response.lease_id
-        except (grpc.RpcError, RuntimeError) as exc:
+            self.lease_ttl_ms = int(response.lease_ttl_ms)
+            self.meta_generation = response.meta_generation
+            self.sync_required = bool(response.require_inventory_sync)
+        except grpc.RpcError as exc:
+            self.sync_required = True
+            logger.warning("GlobalKV V2 registration temporarily failed: %s", exc)
+        except RuntimeError as exc:
             if self.protocol == "v2":
                 raise
             logger.warning("GlobalKV V2 registration failed; V1 remains active: %s", exc)
@@ -240,16 +260,7 @@ class KvCacheClient:
     def report_stored_blocks(self, blocks: list[KvBlockMetadata]) -> int:
         if not blocks or self.v2_stub is None:
             return 0
-        proto_blocks = [
-            kvcache_v2_pb2.BlockDescriptorV2(
-                seq_hash=block.seq_hash,
-                parent_hash=block.parent_hash or b"",
-                position=block.position,
-                offset=block.offset,
-                token_ids=block.token_ids,
-            )
-            for block in blocks
-        ]
+        proto_blocks = [self._proto_block(block) for block in blocks]
         return self._report_mutation(
             store=kvcache_v2_pb2.StoreBlocksV2(blocks=proto_blocks)
         )
@@ -289,28 +300,201 @@ class KvCacheClient:
             ],
         )
         try:
-            response = self.v2_stub.ReportCacheMutations(
-                request,
-                timeout=self.rpc_timeout,
-            )
+            response = None
+            for attempt in range(3):
+                try:
+                    response = self.v2_stub.ReportCacheMutations(
+                        request,
+                        timeout=self.rpc_timeout,
+                    )
+                    break
+                except grpc.RpcError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05 * (2**attempt))
+            assert response is not None
             accepted = {
                 kvcache_v2_pb2.MUTATION_STATUS_V2_COMMITTED,
                 kvcache_v2_pb2.MUTATION_STATUS_V2_DUPLICATE,
             }
             if response.status not in accepted:
+                self.sync_required = bool(response.require_inventory_sync)
                 raise RuntimeError(
                     "GlobalKV V2 mutation rejected: "
                     f"status={response.status} detail={response.error_detail}"
                 )
             return int(response.committed_through_seq)
         except (grpc.RpcError, RuntimeError) as exc:
-            if self.protocol == "v2":
-                raise
-            logger.warning("GlobalKV V2 shadow mutation failed: %s", exc)
+            self.sync_required = True
+            logger.warning("GlobalKV V2 mutation requires recovery: %s", exc)
             return 0
     
+    def heartbeat(self) -> bool:
+        if self.v2_stub is None or self.instance_key is None:
+            return False
+        try:
+            response = self.v2_stub.Heartbeat(
+                kvcache_v2_pb2.HeartbeatV2Request(
+                    session=self._session(),
+                    known_meta_generation=self.meta_generation,
+                ),
+                timeout=self.rpc_timeout,
+            )
+            if response.require_registration:
+                if self._metadata is not None:
+                    self._register_instance_v2(self._metadata)
+                return False
+            self.meta_generation = response.meta_generation
+            self.lease_ttl_ms = int(response.lease_ttl_ms)
+            self.sync_required = self.sync_required or bool(
+                response.require_inventory_sync
+            )
+            return bool(response.accepted)
+        except grpc.RpcError as exc:
+            logger.warning("GlobalKV V2 heartbeat failed: %s", exc)
+            return False
+
+    def sync_inventory(self, blocks: list[KvBlockMetadata], page_size: int) -> bool:
+        if self.v2_stub is None or self.instance_key is None:
+            return False
+        proto_blocks = [self._proto_block(block) for block in blocks]
+        pages = [
+            proto_blocks[index : index + page_size]
+            for index in range(0, len(proto_blocks), page_size)
+        ] or [[]]
+        try:
+            begin = self.v2_stub.BeginInventorySync(
+                kvcache_v2_pb2.BeginInventorySyncV2Request(
+                    session=self._session(),
+                    compatibility_group_id=self.compatibility_group_id,
+                    base_event_seq=self.event_seq,
+                    total_blocks=len(proto_blocks),
+                    total_pages=len(pages),
+                    inventory_checksum=self._inventory_checksum(proto_blocks),
+                ),
+                timeout=self.rpc_timeout,
+            )
+            if not begin.accepted:
+                return False
+            effective_page_size = min(page_size, int(begin.page_size_limit))
+            if effective_page_size != page_size:
+                self.v2_stub.AbortInventorySync(
+                    kvcache_v2_pb2.AbortInventorySyncV2Request(
+                        session=self._session(), sync_id=begin.sync_id
+                    ),
+                    timeout=self.rpc_timeout,
+                )
+                return self.sync_inventory(blocks, effective_page_size)
+            for page_id, page in enumerate(pages):
+                uploaded = self.v2_stub.UploadInventoryPage(
+                    kvcache_v2_pb2.UploadInventoryPageV2Request(
+                        session=self._session(),
+                        sync_id=begin.sync_id,
+                        page_id=page_id,
+                        blocks=page,
+                        page_checksum=self._inventory_checksum(page),
+                    ),
+                    timeout=self.rpc_timeout,
+                )
+                if not uploaded.accepted:
+                    return False
+            committed = self.v2_stub.CommitInventorySync(
+                kvcache_v2_pb2.CommitInventorySyncV2Request(
+                    session=self._session(), sync_id=begin.sync_id
+                ),
+                timeout=self.rpc_timeout,
+            )
+            self.sync_required = not committed.committed
+            return bool(committed.committed)
+        except grpc.RpcError as exc:
+            logger.warning("GlobalKV V2 inventory sync failed: %s", exc)
+            self.sync_required = True
+            return False
+
+    def report_request_start_v2(
+        self, request_id: str, blocks: list[KvBlockMetadata]
+    ) -> None:
+        if self.v2_stub is None or self.instance_key is None:
+            return
+        try:
+            self.v2_stub.ReportRequestStart(
+                kvcache_v2_pb2.ReportRequestStartV2Request(
+                    request=kvcache_v2_pb2.RequestIdentityV2(
+                        instance=self._session().instance,
+                        request_id=request_id,
+                    ),
+                    blocks=[self._proto_block(block) for block in blocks],
+                ),
+                timeout=self.rpc_timeout,
+            )
+        except grpc.RpcError as exc:
+            logger.debug("GlobalKV request start dropped: %s", exc)
+
+    def report_request_end_v2(self, request_id: str) -> None:
+        if self.v2_stub is None or self.instance_key is None:
+            return
+        try:
+            self.v2_stub.ReportRequestEnd(
+                kvcache_v2_pb2.ReportRequestEndV2Request(
+                    request=kvcache_v2_pb2.RequestIdentityV2(
+                        instance=self._session().instance,
+                        request_id=request_id,
+                    )
+                ),
+                timeout=self.rpc_timeout,
+            )
+        except grpc.RpcError as exc:
+            logger.debug("GlobalKV request end dropped: %s", exc)
+
+    def _session(self):
+        assert self.instance_key is not None
+        return kvcache_v2_pb2.InstanceSessionV2(
+            instance=kvcache_v2_pb2.InstanceIdentityV2(
+                key=kvcache_v2_pb2.InstanceKeyV2(
+                    lmcache_instance_id=self.instance_key.lmcache_instance_id,
+                    worker_id=self.instance_key.worker_id,
+                ),
+                epoch=self.instance_epoch,
+            ),
+            lease_id=self.lease_id,
+        )
+
+    @staticmethod
+    def _proto_block(block: KvBlockMetadata):
+        return kvcache_v2_pb2.BlockDescriptorV2(
+            seq_hash=block.seq_hash,
+            parent_hash=block.parent_hash or b"",
+            position=block.position,
+            offset=block.offset,
+            token_ids=block.token_ids,
+        )
+
+    @staticmethod
+    def _inventory_checksum(blocks) -> bytes:
+        digest = hashlib.sha256()
+        for block in blocks:
+            for value in (bytes(block.seq_hash), bytes(block.parent_hash)):
+                digest.update(len(value).to_bytes(8, "big"))
+                digest.update(value)
+            digest.update(int(block.position).to_bytes(4, "big"))
+            digest.update(int(block.offset).to_bytes(4, "big"))
+            digest.update(len(block.token_ids).to_bytes(8, "big"))
+            for token in block.token_ids:
+                digest.update(int(token).to_bytes(4, "big"))
+        return digest.digest()
+
     def close(self):
         """关闭连接"""
+        if self.v2_stub is not None and self.instance_key is not None:
+            try:
+                self.v2_stub.UnregisterInstance(
+                    kvcache_v2_pb2.UnregisterInstanceV2Request(
+                        session=self._session()
+                    ),
+                    timeout=self.rpc_timeout,
+                )
+            except grpc.RpcError:
+                pass
         if self.channel:
             self.channel.close()
             print("连接已关闭")

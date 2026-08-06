@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import asyncio
 import queue
 import threading
+import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -59,6 +60,15 @@ class _KvTransferJob:
     result: Future[KvTransferPeerResult]
 
 
+@dataclass(frozen=True)
+class _MetadataEvent:
+    kind: str
+    blocks: tuple[KvBlockMetadata, ...] = ()
+    hashes: tuple[bytes, ...] = ()
+    request_id: str = ""
+    revision: int = 0
+
+
 class KvCacheMetadataReporter(KvMetadataReporterInterface):
     """Adapter that exposes KvCacheClient through the core reporter interface."""
 
@@ -67,6 +77,26 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
         self._ledger: dict[bytes, KvBlockMetadata] = {}
         self._replica_versions: dict[bytes, int] = {}
         self._ledger_lock = threading.Lock()
+        self._ledger_revision = 0
+        self._synced_revision = 0
+        queue_size = max(
+            1,
+            int(
+                client.config.get_extra_config_value(
+                    "globalkv_metadata_queue_size", 4096
+                )
+            ),
+        )
+        self._metadata_queue: queue.Queue[_MetadataEvent | None] = queue.Queue(
+            maxsize=queue_size
+        )
+        self._reporter_shutdown = False
+        self._reporter_thread = threading.Thread(
+            target=self._reporter_loop,
+            name="GlobalKvMetadataReporter",
+            daemon=True,
+        )
+        self._reporter_thread.start()
 
     def on_kv_stored(self, tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
@@ -80,6 +110,34 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
         with self._ledger_lock:
             for block in blocks:
                 self._ledger[block.seq_hash] = block
+            self._ledger_revision += 1
+            revision = self._ledger_revision
+        if self._client.protocol in {"v1", "dual"}:
+            self._client.upload_kv_meta(
+                [token for block in blocks for token in block.token_ids]
+            )
+        if self._client.protocol in {"dual", "v2"}:
+            self._enqueue_metadata(
+                _MetadataEvent(
+                    kind="store", blocks=tuple(blocks), revision=revision
+                ),
+                mutation=True,
+            )
+        with self._ledger_lock:
+            return {
+                block.seq_hash: self._replica_versions.get(block.seq_hash, 0)
+                for block in blocks
+            }
+
+    def on_kv_stored_structured_sync(
+        self, blocks: list[KvBlockMetadata]
+    ) -> dict[bytes, int]:
+        if not blocks:
+            return {}
+        with self._ledger_lock:
+            for block in blocks:
+                self._ledger[block.seq_hash] = block
+            self._ledger_revision += 1
         if self._client.protocol in {"v1", "dual"}:
             self._client.upload_kv_meta(
                 [token for block in blocks for token in block.token_ids]
@@ -93,10 +151,7 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
                     self._replica_versions[block.seq_hash] = max(
                         version, self._replica_versions.get(block.seq_hash, 0)
                     )
-            return {
-                block.seq_hash: self._replica_versions.get(block.seq_hash, 0)
-                for block in blocks
-            }
+            return {block.seq_hash: version for block in blocks}
 
     def on_kv_retrieved(self, hit_tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
@@ -106,27 +161,160 @@ class KvCacheMetadataReporter(KvMetadataReporterInterface):
         with self._ledger_lock:
             for chunk_hash in chunk_hashes:
                 self._ledger.pop(chunk_hash, None)
+            self._ledger_revision += 1
+            revision = self._ledger_revision
         if self._client.protocol in {"v1", "dual"}:
             self._client.remove_kv_meta(chunk_hashes)
         if self._client.protocol in {"dual", "v2"}:
-            version = self._client.report_removed_blocks(chunk_hashes)
-            if version > 0:
-                with self._ledger_lock:
-                    for chunk_hash in chunk_hashes:
-                        self._replica_versions[chunk_hash] = max(
-                            version, self._replica_versions.get(chunk_hash, 0)
-                        )
+            self._enqueue_metadata(
+                _MetadataEvent(
+                    kind="remove",
+                    hashes=tuple(chunk_hashes),
+                    revision=revision,
+                ),
+                mutation=True,
+            )
 
     def on_request_start(self, request_id: str, tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
             self._client.new_request(request_id, tokens)
+        if self._client.protocol in {"dual", "v2"}:
+            with self._ledger_lock:
+                candidates = sorted(
+                    self._ledger.values(), key=lambda block: block.position
+                )
+            matched: list[KvBlockMetadata] = []
+            cursor = 0
+            for block in candidates:
+                block_tokens = list(block.token_ids)
+                if tokens[cursor : cursor + len(block_tokens)] != block_tokens:
+                    break
+                matched.append(block)
+                cursor += len(block_tokens)
+            self._enqueue_metadata(
+                _MetadataEvent(
+                    kind="request_start",
+                    request_id=request_id,
+                    blocks=tuple(matched),
+                ),
+                mutation=False,
+            )
 
     def on_request_end(self, request_id: str, tokens: list[int]) -> None:
         if self._client.protocol in {"v1", "dual"}:
             self._client.request_end(request_id, tokens)
+        if self._client.protocol in {"dual", "v2"}:
+            self._enqueue_metadata(
+                _MetadataEvent(kind="request_end", request_id=request_id),
+                mutation=False,
+            )
 
     def close(self) -> None:
+        self._reporter_shutdown = True
+        try:
+            self._metadata_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._reporter_thread.join(timeout=1.0)
         self._client.close()
+
+    def _enqueue_metadata(self, event: _MetadataEvent, *, mutation: bool) -> None:
+        try:
+            self._metadata_queue.put_nowait(event)
+        except queue.Full:
+            if mutation:
+                self._client.sync_required = True
+            logger.warning("GlobalKV metadata queue full; kind=%s", event.kind)
+
+    def _reporter_loop(self) -> None:
+        heartbeat_seconds = max(
+            0.1,
+            float(
+                self._client.config.get_extra_config_value(
+                    "globalkv_heartbeat_interval_seconds", 5.0
+                )
+            ),
+        )
+        inventory_page_size = max(
+            1,
+            int(
+                self._client.config.get_extra_config_value(
+                    "globalkv_inventory_page_size", 256
+                )
+            ),
+        )
+        next_heartbeat = time.monotonic()
+        while not self._reporter_shutdown:
+            timeout = max(0.0, next_heartbeat - time.monotonic())
+            try:
+                event = self._metadata_queue.get(timeout=timeout)
+            except queue.Empty:
+                event = None
+            if time.monotonic() >= next_heartbeat:
+                self._client.heartbeat()
+                lease_interval = (
+                    self._client.lease_ttl_ms / 3000.0
+                    if self._client.lease_ttl_ms > 0
+                    else heartbeat_seconds
+                )
+                next_heartbeat = time.monotonic() + min(
+                    heartbeat_seconds, max(0.1, lease_interval)
+                )
+            if self._client.sync_required:
+                with self._ledger_lock:
+                    snapshot = list(self._ledger.values())
+                    snapshot_revision = self._ledger_revision
+                if self._client.sync_inventory(snapshot, inventory_page_size):
+                    self._synced_revision = max(
+                        self._synced_revision, snapshot_revision
+                    )
+            if event is None:
+                if self._reporter_shutdown:
+                    self._metadata_queue.task_done()
+                    return
+                continue
+            if (
+                event.kind in {"store", "remove"}
+                and event.revision <= self._synced_revision
+            ):
+                self._metadata_queue.task_done()
+                continue
+            try:
+                if event.kind == "store":
+                    version = self._client.report_stored_blocks(list(event.blocks))
+                    if version > 0:
+                        with self._ledger_lock:
+                            for block in event.blocks:
+                                self._replica_versions[block.seq_hash] = max(
+                                    version,
+                                    self._replica_versions.get(block.seq_hash, 0),
+                                )
+                elif event.kind == "remove":
+                    version = self._client.report_removed_blocks(list(event.hashes))
+                    if version > 0:
+                        with self._ledger_lock:
+                            for seq_hash in event.hashes:
+                                self._replica_versions[seq_hash] = max(
+                                    version,
+                                    self._replica_versions.get(seq_hash, 0),
+                                )
+                elif event.kind == "request_start":
+                    self._client.report_request_start_v2(
+                        event.request_id, list(event.blocks)
+                    )
+                elif event.kind == "request_end":
+                    self._client.report_request_end_v2(event.request_id)
+            except Exception as exc:
+                if event.kind in {"store", "remove"}:
+                    self._client.sync_required = True
+                logger.error(
+                    "GlobalKV metadata reporter event failed: kind=%s error=%s",
+                    event.kind,
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._metadata_queue.task_done()
 
     def ledger_snapshot(self) -> dict[bytes, KvBlockMetadata]:
         with self._ledger_lock:

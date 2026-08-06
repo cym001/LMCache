@@ -910,12 +910,12 @@ class KvTransferBackend(StoragePluginInterface):
                 token_ids,
                 migrated_keys,
             )
-            versions = (
-                self.local_cpu_backend.metadata_reporter.on_kv_stored_structured(
-                    descriptors
-                )
-                or {}
-            )
+            reporter = self.local_cpu_backend.metadata_reporter
+            report_sync = getattr(reporter, "on_kv_stored_structured_sync", None)
+            if report_sync is not None:
+                versions = report_sync(descriptors) or {}
+            else:
+                versions = reporter.on_kv_stored_structured(descriptors) or {}
         if self.kv_events is None:
             return versions
         for event in build_migrated_store_events(
