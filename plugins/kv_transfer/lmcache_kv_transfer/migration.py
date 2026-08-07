@@ -220,10 +220,9 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
         engine = self._engine
         if engine is None:
             return False
-        with engine._foreground_condition:
-            while engine._foreground_ops > 0 and not self._migration_worker_shutdown:
-                engine._foreground_condition.wait(timeout=0.1)
-            return not self._migration_worker_shutdown
+        return engine.wait_for_foreground_idle(
+            lambda: self._migration_worker_shutdown
+        )
 
     def _migration_worker_loop(self) -> None:
         while True:
@@ -251,8 +250,7 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
         self._migration_worker_shutdown = True
         engine = self._engine
         if engine is not None:
-            with engine._foreground_condition:
-                engine._foreground_condition.notify_all()
+            engine.notify_foreground_waiters()
 
         worker = self._migration_worker
         if worker is None or not worker.is_alive():
@@ -293,8 +291,7 @@ class GlobalKvMigrationPlugin(KvMigrationPluginInterface):
             return KV_TRANSFER_NOT_FOUND
 
         try:
-            block_mapping = engine.lookup_pins[job.event_id]
-            keys = block_mapping.get(job.old_position, [])
+            keys = engine.get_pinned_lookup_keys(job.event_id, job.old_position)
             if not keys:
                 logger.info(
                     "KV transfer is not performed as no matching keys were found "

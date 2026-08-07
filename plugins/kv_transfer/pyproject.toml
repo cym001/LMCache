@@ -14,7 +14,7 @@ dependencies = [
     "grpcio",
     "msgspec",
     "torch",
-    "zmq",
+    "pyzmq>=25.0.0",
 ]
 
 [tool.setuptools.packages.find]

@@ -938,6 +938,10 @@ class StorageManager:
         """
         return list(self.storage_backends.keys())
 
+    def iter_storage_backends(self) -> tuple[StorageBackendInterface, ...]:
+        """Return a stable snapshot of configured storage backends."""
+        return tuple(self.storage_backends.values())
+
     def contains(
         self,
         key: CacheEngineKey,
@@ -1361,7 +1365,7 @@ class StorageManager:
                 lmcache_worker=self.lmcache_worker,
                 skip_backends=existing_names,
                 existing_backends=self.storage_backends,
-                global_kvclient=global_kvclient,
+                global_kvclient=self.global_kvclient,
             )
 
             created: Dict[str, str] = {}

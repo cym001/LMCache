@@ -53,6 +53,9 @@ def _make_plugin_with_engine(
     storage_manager.loop = object()
     storage_manager.batched_get.return_value = [memory_obj]
     storage_manager.storage_backends = {"KvTransferBackend": MagicMock()}
+    storage_manager.iter_storage_backends.return_value = tuple(
+        storage_manager.storage_backends.values()
+    )
     kv_backend = storage_manager.storage_backends["KvTransferBackend"]
     kv_backend.transfer_channel.get_local_mem_indices.return_value = [7]
     kv_backend.transfer_to_peer = MagicMock(return_value=object())
@@ -121,6 +124,7 @@ def test_kv_transfer_releases_memory_obj_on_missing_backend(
 ) -> None:
     plugin, engine, memory_obj = _make_plugin_with_engine(monkeypatch)
     engine.storage_manager.storage_backends = {}
+    engine.storage_manager.iter_storage_backends.return_value = ()
 
     try:
         result = plugin.transfer(
@@ -156,6 +160,7 @@ def test_execute_kv_transfer_passes_full_sequence_put_metadata(
     kv_backend = MagicMock()
     kv_backend.transfer_channel.get_local_mem_indices.return_value = [7]
     storage_manager.storage_backends = {"KvTransferBackend": kv_backend}
+    storage_manager.iter_storage_backends.return_value = (kv_backend,)
     engine.storage_manager = storage_manager
     engine.lookup_pins = {"evt": {"LocalCPUBackend": [key]}}
     engine.lookup = MagicMock(return_value=16)

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
-from contextlib import nullcontext
 import keyword
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence, Union
 import threading

@@ -256,8 +256,9 @@ class LMCacheEngine:
 
         self.use_layerwise = config.use_layerwise
 
-        if self._kv_migration_plugin is not None:
-            self._kv_migration_plugin.start(self)
+        self._foreground_condition = threading.Condition()
+        self._foreground_ops = 0
+        self._kv_migration_plugin_started = False
 
         # TODO: support save_only_first_rank when use layerwise
         # if use_layerwise is True, all ranks will initialize the storage_manager
@@ -308,9 +309,6 @@ class LMCacheEngine:
         self.lookup_pins: dict[str, dict[str, list]] = defaultdict(
             lambda: defaultdict(list)
         )
-
-        self._foreground_condition = threading.Condition()
-        self._foreground_ops = 0
 
         InitializeUsageContext(config, metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -436,6 +434,9 @@ class LMCacheEngine:
                     )
                     if local_cpu_backend is not None:
                         local_cpu_backend.set_kv_events_sink(self.kv_events)
+            if self._kv_migration_plugin is not None:
+                self._kv_migration_plugin.start(self)
+                self._kv_migration_plugin_started = True
             self.post_inited = True
 
     def freeze(self, enabled: bool) -> None:
@@ -488,6 +489,39 @@ class LMCacheEngine:
         if self.storage_manager is not None:
             return self.storage_manager.is_hot_cache_enabled()
         return False
+
+    def wait_for_foreground_idle(self, should_stop: Callable[[], bool]) -> bool:
+        """Wait until active store and retrieve operations have completed.
+
+        Args:
+            should_stop: Callback returning whether the wait should stop early.
+
+        Returns:
+            ``True`` when the engine is idle, or ``False`` when interrupted.
+        """
+        with self._foreground_condition:
+            while self._foreground_ops > 0 and not should_stop():
+                self._foreground_condition.wait(timeout=0.1)
+            return not should_stop()
+
+    def notify_foreground_waiters(self) -> None:
+        """Wake callers waiting for foreground operations to complete."""
+        with self._foreground_condition:
+            self._foreground_condition.notify_all()
+
+    def get_pinned_lookup_keys(
+        self, lookup_id: str, location: str
+    ) -> list[CacheEngineKey]:
+        """Return keys pinned by a lookup for one storage location.
+
+        Args:
+            lookup_id: Identifier passed to :meth:`lookup`.
+            location: Storage backend name used for the lookup.
+
+        Returns:
+            A copy of the pinned key list, or an empty list when unavailable.
+        """
+        return list(self.lookup_pins.get(lookup_id, {}).get(location, []))
 
     def _enter_foreground_operation(self) -> None:
         with self._foreground_condition:
@@ -2065,8 +2099,12 @@ class LMCacheEngine:
             except Exception as e:
                 logger.error("Error closing hidden_state_store: %s", e)
 
-        if self._kv_migration_plugin is not None:
+        if (
+            self._kv_migration_plugin is not None
+            and self._kv_migration_plugin_started
+        ):
             self._kv_migration_plugin.stop()
+            self._kv_migration_plugin_started = False
 
         if self.lmcache_worker is not None:
             try:

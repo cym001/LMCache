@@ -16,11 +16,14 @@ import zmq
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, CacheEvent
 from lmcache.v1.config import LMCacheEngineConfig
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObj,
+from lmcache.v1.kv_event_utils import (
+    build_migrated_store_events,
+    validate_full_sequence_token_ids,
+)
+from lmcache.v1.memory_allocators.paged_cpu_gpu_memory_allocator import (
     PagedCpuGpuMemoryAllocator,
 )
+from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.rpc_utils import get_zmq_context, get_zmq_socket
 from lmcache.v1.storage_backend.abstract_backend import (
@@ -28,20 +31,12 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StoragePluginInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.kv_event_utils import (
-    build_migrated_store_events,
-    validate_full_sequence_token_ids,
-)
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
     TokenDatabase,
 )
 from lmcache.v1.transfer_channel import CreateTransferChannel
-from lmcache.v1.transfer_channel.transfer_utils import (
-    P2PInitSideMsg as KvTransferInitSideMsg,
-    P2PInitSideRetMsg as KvTransferInitSideRetMsg,
-)
 from lmcache.v1.transfer_channel.nixl_channel import (
     NixlInitRequest,
     NixlInitResponse,
@@ -49,7 +44,11 @@ from lmcache.v1.transfer_channel.nixl_channel import (
     NixlMemRegResponse,
     NixlMsg,
 )
-from lmcache.v1.transfer_channel.transfer_utils import SideMsg
+from lmcache.v1.transfer_channel.transfer_utils import (
+    P2PInitSideMsg as KvTransferInitSideMsg,
+    P2PInitSideRetMsg as KvTransferInitSideRetMsg,
+    SideMsg,
+)
 
 if TYPE_CHECKING:
     # First Party
@@ -355,7 +354,7 @@ class KvTransferBackend(StoragePluginInterface):
         pin: bool = False,
     ) -> int:
         # KvTransferBackend does not support lookup without explicit peer connection
-        return NotImplementedError
+        raise NotImplementedError
 
     async def _handle_init_requests(self):
         """Handle initialization requests and KV transfer requests from peer nodes.

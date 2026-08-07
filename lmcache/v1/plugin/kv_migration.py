@@ -232,7 +232,7 @@ def load_metadata_reporter(
 
 def find_kv_transfer_backend(storage_manager: Any) -> Any | None:
     """Locate the configured KV transfer storage backend."""
-    for backend in storage_manager.storage_backends.values():
+    for backend in storage_manager.iter_storage_backends():
         if str(backend) == "KvTransferBackend":
             return backend
         transfer_to_peer = getattr(backend, "transfer_to_peer", None)
